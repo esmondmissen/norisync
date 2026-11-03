@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>NoriSync</title>
+</head>
+<body>
+    <div id="NoriSyncConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox,emby-select">
+        <div data-role="content">
+            <div class="content-primary">
+                <div class="verticalSection">
+                    <button is="emby-button" type="button" id="OpenArtworkManager" class="raised block emby-button">
+                        <span>Open Artwork Manager</span>
+                    </button>
+                    <div class="fieldDescription">Manage Primary / Backdrop / Logo images and looping video artwork for artists and albums.</div>
+                </div>
+
+                <form id="NoriSyncConfigForm">
+                    <div class="verticalSection">
+                        <h2>Retention</h2>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="RetentionDays">Retention Period (days)</label>
+                            <input id="RetentionDays" name="RetentionDays" type="number" is="emby-input" min="1" max="365" />
+                            <div class="fieldDescription">Change records older than this are purged. Registered clients that haven't contacted the server within this many days are also dropped from retention gating.</div>
+                        </div>
+                    </div>
+
+                    <div class="verticalSection">
+                        <h2>Audio Analysis</h2>
+                        <p class="fieldDescription" style="margin-top:0">
+                            Runs daily. Decodes each track with ffmpeg and writes a 5-band waveform blob
+                            for clients to visualise.
+                        </p>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="MaxTracksPerRun">Max Tracks Per Run</label>
+                            <input id="MaxTracksPerRun" name="MaxTracksPerRun" type="number" is="emby-input" min="0" max="1000000" />
+                            <div class="fieldDescription">Cap on tracks processed per run. Zero means no cap.</div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AnalysisConcurrency">Worker Concurrency</label>
+                            <input id="AnalysisConcurrency" name="AnalysisConcurrency" type="number" is="emby-input" min="1" max="16" />
+                            <div class="fieldDescription">Tracks processed in parallel. Each worker runs its own ffmpeg decode. 2 or 3 is typical.</div>
+                        </div>
+                    </div>
+
+                    <div class="verticalSection">
+                        <h2>Lidarr</h2>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="LidarrBaseUrl">Lidarr URL</label>
+                            <input id="LidarrBaseUrl" name="LidarrBaseUrl" type="url" is="emby-input" placeholder="http://lidarr:8686" />
+                            <div class="fieldDescription">Base URL of a Lidarr instance reachable from the Jellyfin server. Leave empty to disable.</div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="LidarrApiKey">Lidarr API Key</label>
+                            <input id="LidarrApiKey" name="LidarrApiKey" type="text" is="emby-input" autocomplete="off" spellcheck="false" />
+                            <div class="fieldDescription">Found in Lidarr under Settings → General → Security. Sent as X-Api-Key on every upstream call.</div>
+                        </div>
+
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label class="emby-checkbox-label">
+                                <input id="LidarrRequireAdmin" name="LidarrRequireAdmin" type="checkbox" is="emby-checkbox" />
+                                <span>Restrict requests to administrators</span>
+                            </label>
+                            <div class="fieldDescription">When enabled, only Jellyfin admins can submit album or artist requests. Search and cover lookups remain available to any authenticated user.</div>
+                        </div>
+
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="LidarrRootFolderPath">Root Folder</label>
+                            <select id="LidarrRootFolderPath" name="LidarrRootFolderPath" is="emby-select"></select>
+                            <div class="fieldDescription">Where Lidarr will store music when adding new artists. Populated from Lidarr after the URL and API key are saved.</div>
+                        </div>
+
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="LidarrQualityProfileId">Quality Profile</label>
+                            <select id="LidarrQualityProfileId" name="LidarrQualityProfileId" is="emby-select"></select>
+                            <div class="fieldDescription">Default quality profile applied to new artists. Populated from Lidarr.</div>
+                        </div>
+
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="LidarrMetadataProfileId">Metadata Profile</label>
+                            <select id="LidarrMetadataProfileId" name="LidarrMetadataProfileId" is="emby-select"></select>
+                            <div class="fieldDescription">Default metadata profile applied to new artists. Populated from Lidarr.</div>
+                        </div>
+                    </div>
+
+                    <div class="verticalSection">
+                        <h2>Animated Artwork</h2>
+                        <p class="fieldDescription" style="margin-top:0">
+                            Short looping videos for album and artist artwork. Albums take both a square loop
+                            (beside the cover) and a tall one (for full-bleed surfaces). Upload them by hand from
+                            the Artwork Manager page, or let the Apple Music backfill below fill albums in on a
+                            schedule.
+                        </p>
+
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label class="emby-checkbox-label">
+                                <input id="AnimatedArtworkEnabled" name="AnimatedArtworkEnabled" type="checkbox" is="emby-checkbox" />
+                                <span>Enable animated artwork</span>
+                            </label>
+                            <div class="fieldDescription">When off, video uploads are rejected and the serve endpoints return 404.</div>
+                        </div>
+
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="AnimatedArtworkQuality">Quality</label>
+                            <select id="AnimatedArtworkQuality" name="AnimatedArtworkQuality" is="emby-select">
+                                <option value="480">Low — 480p</option>
+                                <option value="720">Phone — 720p</option>
+                                <option value="1080">Standard — 1080p</option>
+                                <option value="1440">High — 1440p</option>
+                                <option value="2160">Maximum — 2160p</option>
+                                <option value="custom">Custom…</option>
+                            </select>
+                            <div class="fieldDescription">
+                                Uploads are stored at full quality; this is the size served to clients, transcoded
+                                from the stored file on request (once per size, then cached, bitrate chosen
+                                automatically). The number is the video's short side, as in 1080p — so at 1080 a
+                                square cover is 1080&times;1080, a tall cover 1080&times;1440, and a 16:9 artist
+                                loop 1920&times;1080. Clients can still ask for a different size per device. Also
+                                the size the Apple backfill below aims for when picking which of Apple's
+                                renditions to store.
+                            </div>
+                        </div>
+
+                        <div class="inputContainer" id="AnimatedArtworkTargetResolutionRow">
+                            <label class="inputLabel inputLabelUnfocused" for="AnimatedArtworkTargetResolution">Target Resolution (px)</label>
+                            <input id="AnimatedArtworkTargetResolution" name="AnimatedArtworkTargetResolution" type="number" is="emby-input" min="0" max="8192" />
+                            <div class="fieldDescription">Custom short-side target. Set to 0 to serve originals untouched and fetch at the largest size the source offers.</div>
+                        </div>
+
+                        <h3 style="margin-top:1.5em; margin-bottom:.25em">Apple Music Backfill</h3>
+                        <p class="fieldDescription" style="margin-top:0">
+                            A scheduled task that fetches animated album covers from the Apple Music
+                            animated-artwork service and files them into the slots above. Needs animated
+                            artwork enabled. Runs daily; run it on demand from Scheduled Tasks → NoriSync.
+                        </p>
+
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label class="emby-checkbox-label">
+                                <input id="AppleArtworkBackfillEnabled" name="AppleArtworkBackfillEnabled" type="checkbox" is="emby-checkbox" />
+                                <span>Enable Apple artwork backfill</span>
+                            </label>
+                            <div class="fieldDescription">When on, the daily task backfills albums that don't already have animated artwork.</div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AppleArtworkServiceUrl">Service URL</label>
+                            <input id="AppleArtworkServiceUrl" name="AppleArtworkServiceUrl" type="url" is="emby-input" placeholder="http://apple-music-animated-artworks:8080" />
+                            <div class="fieldDescription">
+                                Base URL of your own <a is="emby-linkbutton" class="button-link" href="https://github.com/m8tec/apple-music-animated-artworks" target="_blank" rel="noopener noreferrer">apple-music-animated-artworks</a>
+                                instance — the scraper that resolves albums to Apple's motion covers. No host is
+                                configured by default; the backfill stays idle until you set this. See the repo for
+                                Docker setup.
+                            </div>
+                            <div id="AppleArtworkUrlWarning" class="fieldDescription" style="display:none; color:#f0c040"></div>
+                        </div>
+
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="AppleArtworkVariant">Variant</label>
+                            <select id="AppleArtworkVariant" name="AppleArtworkVariant" is="emby-select">
+                                <option value="Square">Square → album Primary</option>
+                                <option value="Tall">Tall → album Tall</option>
+                                <option value="Both">Both</option>
+                            </select>
+                            <div class="fieldDescription">Which motion-cover shape to fetch, and the album image slot it fills.</div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AppleArtworkMaxPerRun">Max Albums Per Run</label>
+                            <input id="AppleArtworkMaxPerRun" name="AppleArtworkMaxPerRun" type="number" is="emby-input" min="0" max="1000000" />
+                            <div class="fieldDescription">Cap on albums queried per run, so the first pass over a large library doesn't hammer the service. Zero means no cap.</div>
+                        </div>
+                    </div>
+
+                    <div>
+                        <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                            <span>Save</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        <script type="text/javascript">
+            var NoriSyncConfig = {
+                pluginUniqueId: '11c1ffe5-e4de-4cbb-a30c-c2870eb81603'
+            };
+
+            function populateLidarrSelect(selectId, items, valueKey, labelKey, currentValue) {
+                var select = document.querySelector(selectId);
+                select.innerHTML = '';
+
+                var placeholder = document.createElement('option');
+                placeholder.value = '';
+                placeholder.textContent = '— Select —';
+                select.appendChild(placeholder);
+
+                (items || []).forEach(function (item) {
+                    var opt = document.createElement('option');
+                    opt.value = item[valueKey];
+                    opt.textContent = item[labelKey];
+                    if (String(item[valueKey]) === String(currentValue)) {
+                        opt.selected = true;
+                    }
+                    select.appendChild(opt);
+                });
+            }
+
+            function loadLidarrLists(config) {
+                if (!config.LidarrBaseUrl || !config.LidarrApiKey) {
+                    return Promise.resolve();
+                }
+
+                var fetchJson = function (path) {
+                    return ApiClient.ajax({
+                        type: 'GET',
+                        url: ApiClient.getUrl('api/norisync/lidarr/' + path),
+                        dataType: 'json'
+                    });
+                };
+
+                return Promise.all([
+                    fetchJson('rootfolders'),
+                    fetchJson('qualityprofiles'),
+                    fetchJson('metadataprofiles')
+                ]).then(function (results) {
+                    populateLidarrSelect('#LidarrRootFolderPath', results[0], 'path', 'path', config.LidarrRootFolderPath);
+                    populateLidarrSelect('#LidarrQualityProfileId', results[1], 'id', 'name', config.LidarrQualityProfileId);
+                    populateLidarrSelect('#LidarrMetadataProfileId', results[2], 'id', 'name', config.LidarrMetadataProfileId);
+                }).catch(function () {
+                    // Lidarr unreachable, misconfigured, or not yet saved — leave dropdowns empty.
+                });
+            }
+
+            document.querySelector('#OpenArtworkManager')
+                .addEventListener('click', function() {
+                    Dashboard.navigate('configurationpage?name=NoriSyncArtwork');
+                });
+
+            // The dropdown is a friendly face over AnimatedArtworkTargetResolution, which stays the
+            // only stored value: a preset whose pixels match selects itself, anything else falls to
+            // Custom and reveals the number field.
+            function syncQualityFromTarget(target) {
+                var select = document.querySelector('#AnimatedArtworkQuality');
+                var preset = ['480', '720', '1080', '1440', '2160'].indexOf(String(target)) >= 0 ? String(target) : 'custom';
+                select.value = preset;
+                document.querySelector('#AnimatedArtworkTargetResolutionRow').style.display = preset === 'custom' ? '' : 'none';
+            }
+
+            // There is no default service host, so a backfill switched on without a URL would just
+            // log a warning and do nothing. Flag it here instead of leaving it to the server log.
+            function updateServiceUrlWarning() {
+                var warning = document.querySelector('#AppleArtworkUrlWarning');
+                var enabled = document.querySelector('#AppleArtworkBackfillEnabled').checked;
+                var url = document.querySelector('#AppleArtworkServiceUrl').value.trim();
+
+                if (enabled && !url) {
+                    warning.textContent = 'The backfill will not run until a service URL is set.';
+                    warning.style.display = '';
+                } else {
+                    warning.style.display = 'none';
+                }
+            }
+
+            document.querySelector('#AppleArtworkBackfillEnabled').addEventListener('change', updateServiceUrlWarning);
+            document.querySelector('#AppleArtworkServiceUrl').addEventListener('input', updateServiceUrlWarning);
+
+            document.querySelector('#AnimatedArtworkQuality').addEventListener('change', function () {
+                var quality = this.value;
+                document.querySelector('#AnimatedArtworkTargetResolutionRow').style.display = quality === 'custom' ? '' : 'none';
+                if (quality !== 'custom') {
+                    document.querySelector('#AnimatedArtworkTargetResolution').value = quality;
+                }
+            });
+
+            document.querySelector('#NoriSyncConfigPage')
+                .addEventListener('pageshow', function() {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(NoriSyncConfig.pluginUniqueId).then(function (config) {
+                        document.querySelector('#RetentionDays').value = config.RetentionDays;
+                        document.querySelector('#MaxTracksPerRun').value = config.MaxTracksPerRun;
+                        document.querySelector('#AnalysisConcurrency').value = config.AnalysisConcurrency;
+                        document.querySelector('#LidarrBaseUrl').value = config.LidarrBaseUrl || '';
+                        document.querySelector('#LidarrApiKey').value = config.LidarrApiKey || '';
+                        document.querySelector('#LidarrRequireAdmin').checked = config.LidarrRequireAdmin !== false;
+                        populateLidarrSelect('#LidarrRootFolderPath', [], 'path', 'path', config.LidarrRootFolderPath);
+                        populateLidarrSelect('#LidarrQualityProfileId', [], 'id', 'name', config.LidarrQualityProfileId);
+                        populateLidarrSelect('#LidarrMetadataProfileId', [], 'id', 'name', config.LidarrMetadataProfileId);
+                        document.querySelector('#AnimatedArtworkEnabled').checked = config.AnimatedArtworkEnabled !== false;
+                        var target = config.AnimatedArtworkTargetResolution != null ? config.AnimatedArtworkTargetResolution : 1080;
+                        document.querySelector('#AnimatedArtworkTargetResolution').value = target;
+                        syncQualityFromTarget(target);
+                        document.querySelector('#AppleArtworkBackfillEnabled').checked = config.AppleArtworkBackfillEnabled === true;
+                        document.querySelector('#AppleArtworkServiceUrl').value = config.AppleArtworkServiceUrl || '';
+                        document.querySelector('#AppleArtworkVariant').value = config.AppleArtworkVariant || 'Both';
+                        document.querySelector('#AppleArtworkMaxPerRun').value = config.AppleArtworkMaxPerRun != null ? config.AppleArtworkMaxPerRun : 100;
+                        updateServiceUrlWarning();
+                        loadLidarrLists(config).then(function () {
+                            Dashboard.hideLoadingMsg();
+                        });
+                    });
+                });
+
+            document.querySelector('#NoriSyncConfigForm')
+                .addEventListener('submit', function(e) {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(NoriSyncConfig.pluginUniqueId).then(function (config) {
+                        config.RetentionDays = parseInt(document.querySelector('#RetentionDays').value);
+                        config.MaxTracksPerRun = parseInt(document.querySelector('#MaxTracksPerRun').value);
+                        config.AnalysisConcurrency = parseInt(document.querySelector('#AnalysisConcurrency').value);
+                        config.LidarrBaseUrl = document.querySelector('#LidarrBaseUrl').value.trim();
+                        config.LidarrApiKey = document.querySelector('#LidarrApiKey').value.trim();
+                        config.LidarrRequireAdmin = document.querySelector('#LidarrRequireAdmin').checked;
+                        config.LidarrRootFolderPath = document.querySelector('#LidarrRootFolderPath').value;
+                        config.LidarrQualityProfileId = parseInt(document.querySelector('#LidarrQualityProfileId').value, 10) || 0;
+                        config.LidarrMetadataProfileId = parseInt(document.querySelector('#LidarrMetadataProfileId').value, 10) || 0;
+                        config.AnimatedArtworkEnabled = document.querySelector('#AnimatedArtworkEnabled').checked;
+                        config.AnimatedArtworkTargetResolution = parseInt(document.querySelector('#AnimatedArtworkTargetResolution').value, 10) || 0;
+                        config.AppleArtworkBackfillEnabled = document.querySelector('#AppleArtworkBackfillEnabled').checked;
+                        config.AppleArtworkServiceUrl = document.querySelector('#AppleArtworkServiceUrl').value.trim();
+                        config.AppleArtworkVariant = document.querySelector('#AppleArtworkVariant').value;
+                        config.AppleArtworkMaxPerRun = parseInt(document.querySelector('#AppleArtworkMaxPerRun').value, 10) || 0;
+                        ApiClient.updatePluginConfiguration(NoriSyncConfig.pluginUniqueId, config).then(function (result) {
+                            Dashboard.processPluginConfigurationUpdateResult(result);
+                        });
+                    });
+
+                    e.preventDefault();
+                    return false;
+                });
+        </script>
+    </div>
+</body>
+</html>

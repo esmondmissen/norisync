@@ -1,0 +1,86 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- One build serves Jellyfin 10.11.x and 12.x. The plugin's Jellyfin API
+         surface is identical across both lines, and a net9.0 assembly loads
+         cleanly in Jellyfin 12's .NET 10 host (verified by the integration
+         matrix). Keep it that way: using an API that only exists in 12 would
+         force the build to split again. -->
+    <TargetFramework>net9.0</TargetFramework>
+    <RootNamespace>Jellyfin.Plugin.NoriSync</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Nullable>enable</Nullable>
+    <AnalysisMode>AllEnabledByDefault</AnalysisMode>
+    <CodeAnalysisRuleSet>../jellyfin.ruleset</CodeAnalysisRuleSet>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- Jellyfin refs stay at the FLOOR of the supported range (10.11.0, matching
+       targetAbi). The server refuses to load a plugin that references a newer
+       shared-library version than the host has, so compiling against a later
+       patch (10.11.11) would break 10.11.8 servers; referencing the floor binds
+       fine against every later host, Jellyfin 12 included. -->
+  <ItemGroup>
+    <PackageReference Include="Jellyfin.Controller" Version="10.11.0">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+    <PackageReference Include="Jellyfin.Model" Version="10.11.0">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+    <PackageReference Include="FftSharp" Version="2.2.0" />
+    <PackageReference Include="MessagePack" Version="3.1.12" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.6" />
+    <PackageReference Include="TagLibSharp" Version="2.3.0" />
+    <!-- Lifts the transitive SQLitePCLRaw from Microsoft.Data.Sqlite past
+         GHSA-2m69-gcr7-jv3q (NU1903). Not shipped; host copy resolves. -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.13" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SerilogAnalyzer" Version="0.15.0" PrivateAssets="All" />
+    <PackageReference Include="StyleCop.Analyzers" Version="1.2.0-beta.556" PrivateAssets="All" />
+    <PackageReference Include="SmartAnalyzers.MultithreadingAnalyzer" Version="1.1.31" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="Configuration\configPage.html" />
+    <EmbeddedResource Include="Configuration\configPage.html" />
+    <None Remove="Configuration\artworkManager.html" />
+    <EmbeddedResource Include="Configuration\artworkManager.html" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Jellyfin.Plugin.NoriSync.UnitTests" />
+  </ItemGroup>
+
+  <!-- The Jellyfin host already loads Microsoft.Data.Sqlite, SQLitePCLRaw.*
+       (managed + native runtimes/) and TagLibSharp; the plugin binds to the
+       host's copies. Keep them out of BOTH build and publish output so copying
+       either folder into a server's plugin directory can never shadow host
+       assemblies — bin/ and publish/ then contain exactly the shippable set. -->
+  <Target Name="TrimHostProvidedFromBuild" AfterTargets="ResolveLockFileCopyLocalFiles">
+    <ItemGroup>
+      <ReferenceCopyLocalPaths Remove="@(ReferenceCopyLocalPaths)"
+          Condition="'%(ReferenceCopyLocalPaths.Filename)' == 'Microsoft.Data.Sqlite'
+                  or '%(ReferenceCopyLocalPaths.Filename)' == 'TagLibSharp'
+                  or $([System.String]::Copy('%(ReferenceCopyLocalPaths.Filename)').StartsWith('SQLitePCLRaw'))
+                  or $([System.String]::Copy('%(ReferenceCopyLocalPaths.DestinationSubDirectory)').StartsWith('runtimes'))" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="TrimHostProvidedFromPublish" AfterTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+          Condition="'%(ResolvedFileToPublish.Filename)' == 'Microsoft.Data.Sqlite'
+                  or '%(ResolvedFileToPublish.Filename)' == 'TagLibSharp'
+                  or $([System.String]::Copy('%(ResolvedFileToPublish.Filename)').StartsWith('SQLitePCLRaw'))
+                  or $([System.String]::Copy('%(ResolvedFileToPublish.RelativePath)').StartsWith('runtimes'))" />
+    </ItemGroup>
+  </Target>
+
+</Project>

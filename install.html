@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Installing NoriSync on Jellyfin</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root {
+            --fg: #1a1a1a;
+            --muted: #666;
+            --accent: #0a66c2;
+            --bg: #fff;
+            --code-bg: #f4f4f6;
+            --border: #e2e2e2;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --fg: #e8e8e8;
+                --muted: #9aa0a6;
+                --accent: #4ea8ff;
+                --bg: #121212;
+                --code-bg: #1e1e1e;
+                --border: #2a2a2a;
+            }
+        }
+        body {
+            font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: var(--fg);
+            background: var(--bg);
+            max-width: 760px;
+            margin: 2.5rem auto;
+            padding: 0 1.25rem;
+        }
+        h1 { margin-top: 0; }
+        h2 { margin-top: 2.25rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+        h3 { margin-top: 1.75rem; }
+        code, pre {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            background: var(--code-bg);
+        }
+        code { padding: 0.1rem 0.35rem; border-radius: 3px; font-size: 0.92em; }
+        pre {
+            padding: 0.85rem 1rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            border: 1px solid var(--border);
+        }
+        pre code { background: transparent; padding: 0; font-size: 0.9em; }
+        .muted { color: var(--muted); }
+        table { border-collapse: collapse; width: 100%; margin: 0.75rem 0; }
+        th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+        th { font-weight: 600; }
+        a { color: var(--accent); }
+        .copy-row { display: flex; gap: 0.5rem; align-items: stretch; }
+        .copy-row pre { flex: 1; margin: 0; }
+        .copy-row button {
+            font: inherit;
+            font-size: 0.85em;
+            border: 1px solid var(--border);
+            background: var(--code-bg);
+            color: var(--fg);
+            border-radius: 6px;
+            padding: 0 0.85rem;
+            cursor: pointer;
+        }
+        .copy-row button:hover { border-color: var(--accent); color: var(--accent); }
+        .meta-grid {
+            display: grid;
+            grid-template-columns: max-content 1fr;
+            gap: 0.4rem 1rem;
+            margin: 0.75rem 0;
+        }
+        .meta-grid dt { font-weight: 600; }
+        .meta-grid dd { margin: 0; word-break: break-all; }
+    </style>
+</head>
+<body>
+
+<h1>Installing NoriSync on Jellyfin</h1>
+
+<p>
+    NoriSync is distributed as a Jellyfin plugin repository, so the recommended
+    install path is to add the repo to your Jellyfin server and let Jellyfin
+    handle downloads and updates.
+</p>
+
+<p class="muted">
+    NoriSync &middot; latest <strong>1.0.0.71</strong> &middot;
+    target ABI <code>10.11.0.0</code> &middot; published 2026-05-06
+</p>
+
+<h2>Requirements</h2>
+<ul>
+    <li>Jellyfin matching target ABI <code>10.11.0.0</code> (Jellyfin 10.11.x)</li>
+    <li>Administrator access to the Jellyfin dashboard</li>
+</ul>
+
+<h2>1. Add the plugin repository</h2>
+
+<p>The manifest is published from the project's Gitea releases.</p>
+
+<p><strong>Manifest URL:</strong></p>
+<div class="copy-row">
+    <pre><code id="manifest-url">https://git.missen.ca/Esmond/jellyfin-plugin-norisync/releases/download/manifest/manifest.json</code></pre>
+    <button type="button" data-copy="manifest-url">Copy</button>
+</div>
+
+<p>In Jellyfin:</p>
+<ol>
+    <li>Open <strong>Dashboard → Plugins → Repositories</strong>.</li>
+    <li>Click the <strong>+</strong> button to add a new repository.</li>
+    <li>Fill in:
+        <ul>
+            <li><strong>Repository Name:</strong> <code>NoriSync</code> (or any label you prefer)</li>
+            <li><strong>Repository URL:</strong> the manifest URL above</li>
+        </ul>
+    </li>
+    <li>Click <strong>Save</strong> and accept the prompt to trust the repository.</li>
+</ol>
+
+<p>Jellyfin fetches the manifest and merges NoriSync into the plugin catalog.</p>
+
+<h3>Backup repository (recommended)</h3>
+
+<p>
+    Builds are also published to a GitHub mirror. Add it as a second repository,
+    <em>below</em> the one above, the same way (e.g. name it
+    <code>NoriSync (GitHub)</code>). Jellyfin prefers the first repository and
+    silently skips any it can't reach, so installs and updates keep working
+    when git.missen.ca is down.
+</p>
+
+<p><strong>Backup manifest URL:</strong></p>
+<div class="copy-row">
+    <pre><code id="manifest-url-backup">https://github.com/esmondmissen/norisync/releases/download/manifest/manifest.json</code></pre>
+    <button type="button" data-copy="manifest-url-backup">Copy</button>
+</div>
+
+<h2>2. Install the plugin</h2>
+
+<ol>
+    <li>Switch to the <strong>Catalog</strong> tab on the Plugins page.</li>
+    <li>Under the <strong>General</strong> category, find
+        <strong>NoriSync</strong> — <em>Sync local tracks with Jellyfin</em>.</li>
+    <li>Click it, pick the latest version (<strong>1.0.0.71</strong>,
+        published 2026-05-06), and click <strong>Install</strong>.</li>
+    <li><strong>Restart Jellyfin</strong> when prompted. The plugin won't load
+        until the server process restarts.</li>
+</ol>
+
+<p>
+    After restart, the plugin appears under
+    <strong>Dashboard → Plugins → My Plugins</strong>. Identifying details:
+</p>
+
+<dl class="meta-grid">
+    <dt>Plugin GUID</dt><dd><code>11c1ffe5-e4de-4cbb-a30c-c2870eb81603</code></dd>
+    <dt>Owner</dt><dd>Esmond</dd>
+    <dt>Description</dt><dd>A Jellyfin plugin for synchronizing Nori with your Jellyfin server library.</dd>
+    <dt>Category</dt><dd>General</dd>
+</dl>
+
+<h3>Manual install (alternative)</h3>
+
+<p>
+    If your server can't reach either manifest URL, download the latest zip
+    directly (from here or the
+    <a href="https://github.com/esmondmissen/norisync/releases">GitHub releases</a>)
+    and extract it into Jellyfin's
+    <code>plugins/NoriSync_&lt;version&gt;/</code> directory, then restart Jellyfin.
+</p>
+
+<dl class="meta-grid">
+    <dt>Plugin zip</dt>
+    <dd><a href="https://git.missen.ca/Esmond/jellyfin-plugin-norisync/releases/download/v1.0.0.71/Jellyfin.Plugin.NoriSync_1.0.0.71.zip">Jellyfin.Plugin.NoriSync_1.0.0.71.zip</a></dd>
+    <dt>MD5 checksum</dt>
+    <dd><a href="https://git.missen.ca/Esmond/jellyfin-plugin-norisync/releases/download/v1.0.0.71/Jellyfin.Plugin.NoriSync_1.0.0.71.zip.md5"><code>100a488041f50c210c6df810ed7b9292</code></a></dd>
+    <dt>Manifest</dt>
+    <dd><a href="https://git.missen.ca/Esmond/jellyfin-plugin-norisync/releases/download/manifest/manifest.json">manifest.json</a></dd>
+</dl>
+
+<h3>Source code</h3>
+
+<p>
+    NoriSync is licensed under
+    <a href="https://www.gnu.org/licenses/old-licenses/gpl-2.0.html">GPL-2.0-or-later</a>.
+    The source archive for this build is available if you'd like to inspect or
+    rebuild it before installing the binary.
+</p>
+
+<dl class="meta-grid">
+    <dt>Source zip (v1.0.0.71)</dt>
+    <dd><a href="https://git.missen.ca/Esmond/jellyfin-plugin-norisync/archive/v1.0.0.71.zip">jellyfin-plugin-norisync-v1.0.0.71.zip</a></dd>
+</dl>
+
+<p class="muted">
+    To rebuild from source: extract the zip and run
+    <code>dotnet build Jellyfin.Plugin.NoriSync/Jellyfin.Plugin.NoriSync.csproj -c Release</code>.
+    Outputs land in <code>bin/Release/net9.0/</code>.
+</p>
+
+<h2>3. Configure the plugin</h2>
+
+<p>
+    Open <strong>Dashboard → Plugins → My Plugins → NoriSync</strong> to reach
+    the settings page.
+</p>
+
+<h3>Retention</h3>
+
+<table>
+    <thead><tr><th>Setting</th><th>Default</th><th>Notes</th></tr></thead>
+    <tbody>
+        <tr>
+            <td><strong>Retention Period (days)</strong></td>
+            <td><code>30</code></td>
+            <td>Change records older than this are purged. Also the idle
+                threshold for registered clients — instances silent for this
+                many days are dropped from retention gating.</td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    Lower this if disk usage on the change log is a concern; raise it if you
+    have clients that go offline for extended periods and you don't want them
+    to miss deletes.
+</p>
+
+<h3>Audio analysis</h3>
+
+<p>
+    These settings drive the <em>NoriSync: Analyze Waveforms</em> scheduled
+    task (daily at 03:00 by default). It decodes each track with ffmpeg and
+    writes a compact waveform blob for clients to visualise.
+</p>
+
+<table>
+    <thead><tr><th>Setting</th><th>Default</th><th>Notes</th></tr></thead>
+    <tbody>
+        <tr>
+            <td><strong>Max Tracks Per Run</strong></td>
+            <td><code>0</code></td>
+            <td>Cap on tracks processed per run. <code>0</code> = unlimited.
+                Useful on a large library to spread the initial scan across
+                multiple nights.</td>
+        </tr>
+        <tr>
+            <td><strong>Worker Concurrency</strong></td>
+            <td><code>2</code></td>
+            <td>Parallel workers. Each spawns its own ffmpeg decode, so this
+                multiplies CPU and process count. 2–3 is typical; raise
+                carefully.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h3>Verifying the install</h3>
+
+<p>
+    After saving config, confirm the plugin is live without auth by hitting:
+</p>
+
+<pre><code>GET http://&lt;your-jellyfin&gt;/api/norisync/info</code></pre>
+
+<p>
+    It returns <code>{ id, name, version }</code>. All other endpoints
+    require Jellyfin authentication — see the API section of the
+    <a href="README.md">README</a> for the full endpoint list.
+</p>
+
+<h2>Updating</h2>
+
+<p>
+    Once the repository is added, Jellyfin's plugin catalog will surface new
+    versions automatically. Use <strong>Dashboard → Plugins → My Plugins</strong>
+    to update, then restart Jellyfin.
+</p>
+
+<script>
+document.querySelectorAll('button[data-copy]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+        var target = document.getElementById(btn.getAttribute('data-copy'));
+        if (!target) return;
+        navigator.clipboard.writeText(target.textContent.trim()).then(function () {
+            var original = btn.textContent;
+            btn.textContent = 'Copied';
+            setTimeout(function () { btn.textContent = original; }, 1200);
+        });
+    });
+});
+</script>
+
+</body>
+</html>

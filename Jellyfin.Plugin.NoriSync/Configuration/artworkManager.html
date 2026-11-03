@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>NoriSync Artwork</title>
+</head>
+<body>
+    <div id="NoriSyncArtworkPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-select">
+        <div data-role="content">
+            <div class="content-primary">
+                <div class="verticalSection">
+                    <h2 style="margin-bottom:.25em">Artwork Manager</h2>
+                    <p class="fieldDescription" style="margin-top:0">
+                        Manage Primary / Backdrop / Logo images and looping video artwork for artists and albums.
+                        Albums take two loops — a square one beside the cover and a tall one for full-bleed surfaces.
+                        Changes apply directly to your Jellyfin library. You must be an administrator.
+                    </p>
+                </div>
+
+                <!-- Browser controls -->
+                <div class="verticalSection">
+                    <div style="display:flex; flex-wrap:wrap; gap:.75em; align-items:flex-end">
+                        <div class="localnav" style="display:flex; gap:.5em">
+                            <button type="button" is="emby-button" id="AwTabArtists" class="raised button-submit emby-button">
+                                <span>Artists</span>
+                            </button>
+                            <button type="button" is="emby-button" id="AwTabAlbums" class="raised emby-button">
+                                <span>Albums</span>
+                            </button>
+                        </div>
+                        <div class="inputContainer" style="flex:1 1 240px; margin-bottom:0">
+                            <input id="AwSearch" type="text" is="emby-input" placeholder="Search by name…" autocomplete="off" spellcheck="false" />
+                        </div>
+                        <button type="button" is="emby-button" id="AwSearchBtn" class="raised emby-button">
+                            <span>Search</span>
+                        </button>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:1em; margin-top:.75em">
+                        <button type="button" is="emby-button" id="AwPrev" class="emby-button" disabled>
+                            <span>‹ Prev</span>
+                        </button>
+                        <span id="AwPageInfo" class="fieldDescription" style="margin:0"></span>
+                        <button type="button" is="emby-button" id="AwNext" class="emby-button" disabled>
+                            <span>Next ›</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- List view -->
+                <div id="AwListView">
+                    <div id="AwGrid" class="aw-grid"></div>
+                    <div id="AwGridEmpty" class="fieldDescription" style="display:none">No items found.</div>
+                </div>
+
+                <!-- Detail view -->
+                <div id="AwDetailView" style="display:none">
+                    <div class="verticalSection">
+                        <button type="button" is="emby-button" id="AwBack" class="raised emby-button" style="margin-bottom:1em">
+                            <span>‹ Back to list</span>
+                        </button>
+                        <h2 id="AwDetailTitle" style="margin:0"></h2>
+                        <div id="AwDetailSubtitle" class="fieldDescription" style="margin-top:.25em"></div>
+                    </div>
+                    <div id="AwSlots" class="aw-slots"></div>
+                </div>
+            </div>
+        </div>
+
+        <style>
+            #NoriSyncArtworkPage .aw-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+                gap: 1em;
+                margin-top: 1em;
+            }
+            #NoriSyncArtworkPage .aw-card {
+                cursor: pointer;
+                border-radius: 6px;
+                overflow: hidden;
+                background: rgba(255,255,255,.05);
+                transition: transform .12s ease;
+            }
+            #NoriSyncArtworkPage .aw-card:hover { transform: translateY(-2px); }
+            #NoriSyncArtworkPage .aw-card-thumb {
+                width: 100%;
+                aspect-ratio: 1 / 1;
+                background: rgba(0,0,0,.25) center/cover no-repeat;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: rgba(255,255,255,.35);
+                font-size: 2.5em;
+            }
+            #NoriSyncArtworkPage .aw-card-name {
+                padding: .5em .6em;
+                font-size: .9em;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            #NoriSyncArtworkPage .aw-slots {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                gap: 1.25em;
+                margin-top: 1em;
+            }
+            #NoriSyncArtworkPage .aw-tile {
+                border: 1px solid rgba(255,255,255,.12);
+                border-radius: 8px;
+                padding: 1em;
+                display: flex;
+                flex-direction: column;
+                gap: .6em;
+            }
+            #NoriSyncArtworkPage .aw-tile-label { font-weight: 600; }
+            #NoriSyncArtworkPage .aw-tile-preview {
+                width: 100%;
+                min-height: 140px;
+                max-height: 260px;
+                border-radius: 6px;
+                background: rgba(0,0,0,.3);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                overflow: hidden;
+            }
+            #NoriSyncArtworkPage .aw-tile-preview img,
+            #NoriSyncArtworkPage .aw-tile-preview video {
+                max-width: 100%;
+                max-height: 260px;
+                object-fit: contain;
+            }
+            #NoriSyncArtworkPage .aw-empty { color: rgba(255,255,255,.4); font-size: .9em; }
+            #NoriSyncArtworkPage .aw-tile-actions { display: flex; gap: .5em; flex-wrap: wrap; }
+            #NoriSyncArtworkPage .aw-tile-meta { font-size: .8em; color: rgba(255,255,255,.55); }
+            #NoriSyncArtworkPage .aw-tile-msg { font-size: .85em; min-height: 1em; }
+            #NoriSyncArtworkPage .aw-msg-error { color: #ff6b6b; }
+            #NoriSyncArtworkPage .aw-msg-ok { color: #6bd36b; }
+            #NoriSyncArtworkPage .aw-msg-warn { color: #f0c040; }
+            #NoriSyncArtworkPage .aw-tab-active { background: #00a4dc !important; color:#fff !important; }
+        </style>
+
+        <script type="text/javascript">
+            (function () {
+                var PLUGIN_ID = '11c1ffe5-e4de-4cbb-a30c-c2870eb81603';
+                var PAGE_SIZE = 48;
+                // Long edge may exceed the short edge by this much and still count as square.
+                // Keep in step with ArtworkShape.SquareTolerance on the server.
+                var SQUARE_TOLERANCE = 1.1;
+
+                // Static image types accepted by Jellyfin's native image endpoint.
+                var STATIC_ACCEPT = 'image/jpeg,image/png,image/webp';
+                // Video types accepted by the plugin's animated-artwork endpoint.
+                var VIDEO_ACCEPT = 'video/mp4,video/quicktime,video/webm';
+
+                // Slot descriptors. kind:'static' -> Jellyfin native image API.
+                //                   kind:'video'  -> plugin animated-artwork API.
+                // shape: advisory aspect hint shown on empty video slots; the server warns (but
+                // never rejects) when an upload's aspect ratio doesn't match.
+                var ARTIST_SLOTS = [
+                    { label: 'Primary Image', kind: 'static', imageType: 'Primary' },
+                    { label: 'Primary Video', kind: 'video', imageType: 'Primary' },
+                    { label: 'Backdrop Image', kind: 'static', imageType: 'Backdrop', backdrop: true },
+                    { label: 'Backdrop Video', kind: 'video', imageType: 'Backdrop' },
+                    { label: 'Logo', kind: 'static', imageType: 'Logo' }
+                ];
+                var ALBUM_SLOTS = [
+                    { label: 'Primary Image', kind: 'static', imageType: 'Primary' },
+                    { label: 'Square Video', kind: 'video', imageType: 'Primary', shape: 'square (1:1)' },
+                    { label: 'Tall Video', kind: 'video', imageType: 'Tall', shape: 'portrait (e.g. 3:4)' }
+                ];
+
+                var state = {
+                    type: 'MusicArtist',   // or 'MusicAlbum'
+                    startIndex: 0,
+                    total: 0,
+                    search: '',
+                    config: null
+                };
+
+                var page = document.querySelector('#NoriSyncArtworkPage');
+
+                // --- helpers -------------------------------------------------
+
+                // Read a property tolerant of camelCase vs PascalCase JSON.
+                function prop(obj, name) {
+                    if (obj == null) { return undefined; }
+                    if (obj[name] !== undefined) { return obj[name]; }
+                    var lower = name.charAt(0).toLowerCase() + name.slice(1);
+                    if (obj[lower] !== undefined) { return obj[lower]; }
+                    var upper = name.charAt(0).toUpperCase() + name.slice(1);
+                    return obj[upper];
+                }
+
+                function token() { return ApiClient.accessToken(); }
+
+                // Append ApiKey so a raw <video> src (which can't send headers) authenticates
+                // as the current (admin) session. Not the legacy lowercase api_key: Jellyfin
+                // ignores that unless EnableLegacyAuthorization is on, and it's off by default.
+                function withKey(url) {
+                    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'ApiKey=' + encodeURIComponent(token());
+                }
+
+                // fetch() with the standard Jellyfin Authorization header.
+                function authFetch(url, init) {
+                    init = init || {};
+                    var headers = Object.assign({}, init.headers || {});
+                    headers['Authorization'] = 'MediaBrowser Token="' + token() + '"';
+                    return fetch(url, Object.assign({}, init, { headers: headers }));
+                }
+
+                function staticImageUrl(id, imageType, tag, index) {
+                    var path = 'Items/' + id + '/Images/' + imageType + (index != null ? '/' + index : '');
+                    var url = ApiClient.getUrl(path) + '?tag=' + encodeURIComponent(tag) + '&fillHeight=260&quality=90';
+                    return url;
+                }
+
+                function videoUrl(id, imageType, tag) {
+                    var url = ApiClient.getUrl('api/norisync/artwork/' + id + '/' + imageType);
+                    url = withKey(url);
+                    if (tag) { url += '&t=' + encodeURIComponent(tag); }
+                    return url;
+                }
+
+                function fileToBase64(file) {
+                    return new Promise(function (resolve, reject) {
+                        var reader = new FileReader();
+                        reader.onload = function () {
+                            var result = String(reader.result);
+                            var comma = result.indexOf(',');
+                            resolve(comma >= 0 ? result.substring(comma + 1) : result);
+                        };
+                        reader.onerror = function () { reject(reader.error); };
+                        reader.readAsDataURL(file);
+                    });
+                }
+
+                function humanBytes(n) {
+                    if (n == null) { return ''; }
+                    if (n >= 1048576) { return (n / 1048576).toFixed(1) + ' MB'; }
+                    if (n >= 1024) { return (n / 1024).toFixed(0) + ' KB'; }
+                    return n + ' B';
+                }
+
+                function errorText(resp, body) {
+                    var msg = prop(body, 'Error');
+                    if (msg) { return msg; }
+                    return resp.status + ' ' + (resp.statusText || 'Error');
+                }
+
+                async function readJsonSafe(resp) {
+                    try { return await resp.json(); } catch (e) { return null; }
+                }
+
+                // --- data access ---------------------------------------------
+
+                function queryItems() {
+                    var userId = ApiClient.getCurrentUserId();
+                    var opts = {
+                        SearchTerm: state.search || undefined,
+                        StartIndex: state.startIndex,
+                        Limit: PAGE_SIZE,
+                        SortBy: 'SortName',
+                        SortOrder: 'Ascending',
+                        EnableImageTypes: 'Primary,Backdrop,Logo',
+                        EnableTotalRecordCount: true
+                    };
+                    if (state.type === 'MusicArtist') {
+                        return ApiClient.getArtists(userId, opts);
+                    }
+                    opts.IncludeItemTypes = 'MusicAlbum';
+                    opts.Recursive = true;
+                    return ApiClient.getItems(userId, opts);
+                }
+
+                function fetchItem(id) {
+                    return ApiClient.getItem(ApiClient.getCurrentUserId(), id);
+                }
+
+                // Returns a map of imageType -> video record for the item.
+                function fetchArtwork(id) {
+                    return ApiClient.ajax({
+                        type: 'GET',
+                        url: ApiClient.getUrl('api/norisync/artwork/' + id),
+                        dataType: 'json'
+                    }).then(function (res) {
+                        var map = {};
+                        var list = prop(res, 'Items') || [];
+                        list.forEach(function (rec) {
+                            var t = prop(rec, 'ImageType');
+                            if (t) { map[t] = rec; }
+                        });
+                        return map;
+                    }).catch(function () { return {}; });
+                }
+
+                // --- list view -----------------------------------------------
+
+                function showList() {
+                    document.querySelector('#AwDetailView').style.display = 'none';
+                    document.querySelector('#AwListView').style.display = '';
+                }
+
+                function loadList() {
+                    Dashboard.showLoadingMsg();
+                    return queryItems().then(function (result) {
+                        state.total = prop(result, 'TotalRecordCount') || 0;
+                        renderGrid(prop(result, 'Items') || []);
+                        updatePaging();
+                        Dashboard.hideLoadingMsg();
+                    }).catch(function (err) {
+                        Dashboard.hideLoadingMsg();
+                        Dashboard.alert('Failed to load items: ' + (err && err.message ? err.message : err));
+                    });
+                }
+
+                function renderGrid(items) {
+                    var grid = document.querySelector('#AwGrid');
+                    grid.innerHTML = '';
+                    document.querySelector('#AwGridEmpty').style.display = items.length ? 'none' : '';
+
+                    items.forEach(function (item) {
+                        var card = document.createElement('div');
+                        card.className = 'aw-card';
+
+                        var thumb = document.createElement('div');
+                        thumb.className = 'aw-card-thumb';
+                        var tags = item.ImageTags;
+                        if (tags && tags.Primary) {
+                            thumb.style.backgroundImage = 'url("' +
+                                ApiClient.getUrl('Items/' + item.Id + '/Images/Primary') +
+                                '?tag=' + encodeURIComponent(tags.Primary) + '&fillHeight=200&fillWidth=200&quality=90")';
+                        } else {
+                            thumb.textContent = state.type === 'MusicArtist' ? '♪' : '💿';
+                        }
+
+                        var name = document.createElement('div');
+                        name.className = 'aw-card-name';
+                        name.textContent = item.Name || '(unnamed)';
+                        name.title = item.Name || '';
+
+                        card.appendChild(thumb);
+                        card.appendChild(name);
+                        card.addEventListener('click', function () { openDetail(item.Id); });
+                        grid.appendChild(card);
+                    });
+                }
+
+                function updatePaging() {
+                    var from = state.total === 0 ? 0 : state.startIndex + 1;
+                    var to = Math.min(state.startIndex + PAGE_SIZE, state.total);
+                    document.querySelector('#AwPageInfo').textContent = from + '–' + to + ' of ' + state.total;
+                    document.querySelector('#AwPrev').disabled = state.startIndex <= 0;
+                    document.querySelector('#AwNext').disabled = state.startIndex + PAGE_SIZE >= state.total;
+                }
+
+                // --- detail view ---------------------------------------------
+
+                function openDetail(id) {
+                    Dashboard.showLoadingMsg();
+                    Promise.all([fetchItem(id), fetchArtwork(id)]).then(function (res) {
+                        renderDetail(res[0], res[1]);
+                        document.querySelector('#AwListView').style.display = 'none';
+                        document.querySelector('#AwDetailView').style.display = '';
+                        Dashboard.hideLoadingMsg();
+                    }).catch(function (err) {
+                        Dashboard.hideLoadingMsg();
+                        Dashboard.alert('Failed to load item: ' + (err && err.message ? err.message : err));
+                    });
+                }
+
+                function renderDetail(item, artworkMap) {
+                    document.querySelector('#AwDetailTitle').textContent = item.Name || '(unnamed)';
+                    var subtitle = item.Type === 'MusicArtist' ? 'Artist' : 'Album';
+                    if (item.AlbumArtist) { subtitle += ' · ' + item.AlbumArtist; }
+                    if (item.ProductionYear) { subtitle += ' · ' + item.ProductionYear; }
+                    document.querySelector('#AwDetailSubtitle').textContent = subtitle;
+
+                    var slots = item.Type === 'MusicArtist' ? ARTIST_SLOTS : ALBUM_SLOTS;
+                    var container = document.querySelector('#AwSlots');
+                    container.innerHTML = '';
+
+                    var videoEnabled = state.config && prop(state.config, 'AnimatedArtworkEnabled') !== false;
+
+                    slots.forEach(function (slot) {
+                        if (slot.kind === 'video' && !videoEnabled) { return; }
+                        container.appendChild(buildTile(item, slot, artworkMap));
+                    });
+
+                    if (!videoEnabled) {
+                        var note = document.createElement('div');
+                        note.className = 'fieldDescription';
+                        note.style.gridColumn = '1 / -1';
+                        note.textContent = 'Video artwork is disabled in the NoriSync plugin settings.';
+                        container.appendChild(note);
+                    }
+                }
+
+                function buildTile(item, slot, artworkMap) {
+                    var tile = document.createElement('div');
+                    tile.className = 'aw-tile';
+
+                    var label = document.createElement('div');
+                    label.className = 'aw-tile-label';
+                    label.textContent = slot.label;
+                    tile.appendChild(label);
+
+                    var preview = document.createElement('div');
+                    preview.className = 'aw-tile-preview';
+                    tile.appendChild(preview);
+
+                    var meta = document.createElement('div');
+                    meta.className = 'aw-tile-meta';
+                    tile.appendChild(meta);
+
+                    var actions = document.createElement('div');
+                    actions.className = 'aw-tile-actions';
+                    tile.appendChild(actions);
+
+                    var msg = document.createElement('div');
+                    msg.className = 'aw-tile-msg';
+                    tile.appendChild(msg);
+
+                    var present = false;
+
+                    if (slot.kind === 'static') {
+                        var tags = item.ImageTags || {};
+                        var tag = null;
+                        if (slot.backdrop) {
+                            var bd = item.BackdropImageTags || [];
+                            tag = bd.length ? bd[0] : null;
+                        } else {
+                            tag = tags[slot.imageType] || null;
+                        }
+                        present = !!tag;
+                        if (present) {
+                            var img = document.createElement('img');
+                            img.src = staticImageUrl(item.Id, slot.imageType, tag, slot.backdrop ? 0 : null);
+                            img.alt = slot.label;
+                            preview.appendChild(img);
+                        } else {
+                            preview.appendChild(emptyPlaceholder());
+                        }
+                        meta.textContent = 'JPEG / PNG / WebP';
+                    } else {
+                        var rec = artworkMap[slot.imageType];
+                        present = !!rec;
+                        if (present) {
+                            var video = document.createElement('video');
+                            video.src = videoUrl(item.Id, slot.imageType, prop(rec, 'Tag'));
+                            video.muted = true;
+                            video.loop = true;
+                            video.autoplay = true;
+                            video.setAttribute('playsinline', '');
+                            video.controls = true;
+                            video.preload = 'metadata';
+                            preview.appendChild(video);
+                            var w = prop(rec, 'Width'), h = prop(rec, 'Height'), dur = prop(rec, 'DurationSeconds');
+                            var parts = [prop(rec, 'ContentType')];
+                            if (w && h) { parts.push(w + '×' + h); }
+                            if (dur != null) { parts.push(Number(dur).toFixed(1) + 's'); }
+                            parts.push(humanBytes(prop(rec, 'ByteLength')));
+                            meta.textContent = parts.filter(Boolean).join(' · ');
+                            var mismatch = shapeMismatch(slot, w, h);
+                            if (mismatch) { setMsg(msg, 'Stored video is ' + mismatch + '.', 'aw-msg-warn'); }
+                        } else {
+                            preview.appendChild(emptyPlaceholder());
+                            meta.textContent = videoLimitsText(slot);
+                        }
+                    }
+
+                    // Upload / Replace control (hidden file input behind a button).
+                    var fileInput = document.createElement('input');
+                    fileInput.type = 'file';
+                    fileInput.accept = slot.kind === 'static' ? STATIC_ACCEPT : VIDEO_ACCEPT;
+                    fileInput.style.display = 'none';
+
+                    var uploadBtn = document.createElement('button');
+                    uploadBtn.setAttribute('is', 'emby-button');
+                    uploadBtn.type = 'button';
+                    uploadBtn.className = 'raised emby-button';
+                    uploadBtn.innerHTML = '<span>' + (present ? 'Replace' : 'Upload') + '</span>';
+                    uploadBtn.addEventListener('click', function () { fileInput.click(); });
+
+                    fileInput.addEventListener('change', function () {
+                        if (fileInput.files && fileInput.files.length) {
+                            handleUpload(item, slot, fileInput.files[0], msg);
+                        }
+                    });
+
+                    actions.appendChild(uploadBtn);
+                    actions.appendChild(fileInput);
+
+                    if (present) {
+                        var removeBtn = document.createElement('button');
+                        removeBtn.setAttribute('is', 'emby-button');
+                        removeBtn.type = 'button';
+                        removeBtn.className = 'emby-button';
+                        removeBtn.innerHTML = '<span>Remove</span>';
+                        removeBtn.addEventListener('click', function () { handleDelete(item, slot, msg); });
+                        actions.appendChild(removeBtn);
+                    }
+
+                    return tile;
+                }
+
+                function emptyPlaceholder() {
+                    var el = document.createElement('span');
+                    el.className = 'aw-empty';
+                    el.textContent = 'None set';
+                    return el;
+                }
+
+                function videoLimitsText(slot) {
+                    var bits = ['MP4 / MOV / WebM'];
+                    if (slot && slot.shape) { bits.push(slot.shape); }
+                    return bits.join(' · ');
+                }
+
+                // Mirrors the server's advisory aspect check so an already-stored video sitting in
+                // the wrong shape slot is visible without re-uploading it. Returns null when the
+                // slot has no shape expectation, the dimensions are unknown, or the shape fits.
+                function shapeMismatch(slot, w, h) {
+                    if (!slot.shape || !w || !h) { return null; }
+                    var tall = h > w * SQUARE_TOLERANCE;
+                    if (slot.imageType === 'Tall') { return tall ? null : 'not portrait'; }
+                    return Math.max(w, h) <= Math.min(w, h) * SQUARE_TOLERANCE ? null : 'not square';
+                }
+
+                function setMsg(msg, text, cls) {
+                    msg.textContent = text;
+                    msg.className = 'aw-tile-msg ' + (cls || '');
+                }
+
+                // --- mutations -----------------------------------------------
+
+                async function handleUpload(item, slot, file, msg) {
+                    try {
+                        setMsg(msg, 'Uploading…', '');
+
+                        if (slot.kind === 'static') {
+                            await uploadStatic(item, slot, file);
+                            setMsg(msg, 'Saved.', 'aw-msg-ok');
+                        } else {
+                            var meta = await uploadVideo(item, slot, file);
+                            var warnings = prop(meta, 'Warnings') || [];
+                            if (warnings.length) {
+                                setMsg(msg, 'Saved with warnings: ' + warnings.join(', '), 'aw-msg-warn');
+                            } else {
+                                setMsg(msg, 'Saved.', 'aw-msg-ok');
+                            }
+                        }
+                        // Refresh so preview + tags update.
+                        await refreshDetail(item.Id);
+                    } catch (e) {
+                        setMsg(msg, 'Upload failed: ' + (e && e.message ? e.message : e), 'aw-msg-error');
+                    }
+                }
+
+                async function uploadStatic(item, slot, file) {
+                    // Backdrops are a list; "replace" means drop index 0 first.
+                    if (slot.backdrop) {
+                        var bd = item.BackdropImageTags || [];
+                        if (bd.length) {
+                            await authFetch(ApiClient.getUrl('Items/' + item.Id + '/Images/Backdrop/0'), { method: 'DELETE' });
+                        }
+                    }
+                    var b64 = await fileToBase64(file);
+                    var resp = await authFetch(ApiClient.getUrl('Items/' + item.Id + '/Images/' + slot.imageType), {
+                        method: 'POST',
+                        headers: { 'Content-Type': file.type },
+                        body: b64
+                    });
+                    if (!resp.ok) { throw new Error(errorText(resp, await readJsonSafe(resp))); }
+                }
+
+                async function uploadVideo(item, slot, file) {
+                    var resp = await authFetch(ApiClient.getUrl('api/norisync/artwork/' + item.Id + '/' + slot.imageType), {
+                        method: 'POST',
+                        headers: { 'Content-Type': file.type },
+                        body: file
+                    });
+                    var body = await readJsonSafe(resp);
+                    if (!resp.ok) { throw new Error(errorText(resp, body)); }
+                    return body;
+                }
+
+                async function handleDelete(item, slot, msg) {
+                    try {
+                        setMsg(msg, 'Removing…', '');
+                        if (slot.kind === 'static') {
+                            var path = slot.backdrop
+                                ? 'Items/' + item.Id + '/Images/Backdrop/0'
+                                : 'Items/' + item.Id + '/Images/' + slot.imageType;
+                            var resp = await authFetch(ApiClient.getUrl(path), { method: 'DELETE' });
+                            if (!resp.ok) { throw new Error(errorText(resp, await readJsonSafe(resp))); }
+                        } else {
+                            var vresp = await authFetch(ApiClient.getUrl('api/norisync/artwork/' + item.Id + '/' + slot.imageType), { method: 'DELETE' });
+                            if (!vresp.ok) { throw new Error(errorText(vresp, await readJsonSafe(vresp))); }
+                        }
+                        setMsg(msg, 'Removed.', 'aw-msg-ok');
+                        await refreshDetail(item.Id);
+                    } catch (e) {
+                        setMsg(msg, 'Remove failed: ' + (e && e.message ? e.message : e), 'aw-msg-error');
+                    }
+                }
+
+                function refreshDetail(id) {
+                    return Promise.all([fetchItem(id), fetchArtwork(id)]).then(function (res) {
+                        renderDetail(res[0], res[1]);
+                    });
+                }
+
+                // --- wiring (attached once) ----------------------------------
+
+                function setActiveTab() {
+                    var artistsBtn = document.querySelector('#AwTabArtists');
+                    var albumsBtn = document.querySelector('#AwTabAlbums');
+                    artistsBtn.classList.toggle('aw-tab-active', state.type === 'MusicArtist');
+                    albumsBtn.classList.toggle('aw-tab-active', state.type === 'MusicAlbum');
+                }
+
+                function switchType(type) {
+                    if (state.type === type) { return; }
+                    state.type = type;
+                    state.startIndex = 0;
+                    setActiveTab();
+                    showList();
+                    loadList();
+                }
+
+                function doSearch() {
+                    state.search = document.querySelector('#AwSearch').value.trim();
+                    state.startIndex = 0;
+                    showList();
+                    loadList();
+                }
+
+                document.querySelector('#AwTabArtists').addEventListener('click', function () { switchType('MusicArtist'); });
+                document.querySelector('#AwTabAlbums').addEventListener('click', function () { switchType('MusicAlbum'); });
+                document.querySelector('#AwSearchBtn').addEventListener('click', doSearch);
+                document.querySelector('#AwSearch').addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter') { e.preventDefault(); doSearch(); }
+                });
+                document.querySelector('#AwPrev').addEventListener('click', function () {
+                    state.startIndex = Math.max(0, state.startIndex - PAGE_SIZE);
+                    loadList();
+                });
+                document.querySelector('#AwNext').addEventListener('click', function () {
+                    state.startIndex = state.startIndex + PAGE_SIZE;
+                    loadList();
+                });
+                document.querySelector('#AwBack').addEventListener('click', showList);
+
+                page.addEventListener('pageshow', function () {
+                    setActiveTab();
+                    showList();
+                    ApiClient.getPluginConfiguration(PLUGIN_ID).then(function (config) {
+                        state.config = config;
+                        loadList();
+                    }, function () {
+                        state.config = null;
+                        loadList();
+                    });
+                });
+            })();
+        </script>
+    </div>
+</body>
+</html>

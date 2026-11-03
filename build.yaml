@@ -1,0 +1,18 @@
+---
+# targetAbi is a minimum, not a pin: this single net9.0 build is offered to
+# Jellyfin 10.11.x and 12.x servers alike.
+name: "NoriSync"
+guid: "11c1ffe5-e4de-4cbb-a30c-c2870eb81603"
+version: "1.0.0.0"
+targetAbi: "10.11.0.0"
+framework: "net9.0"
+overview: "Sync local tracks with Jellyfin"
+description: >
+  A Jellyfin plugin for synchronizing local tracks
+  with your Jellyfin server library.
+category: "General"
+owner: "jellyfin"
+artifacts:
+- "Jellyfin.Plugin.NoriSync.dll"
+changelog: >
+  changelog
