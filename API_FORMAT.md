@@ -257,7 +257,10 @@ Feed timestamps are strictly increasing, so a page's `LatestTimestamp` /
 
 JSON-only, **anonymous**. Returns `{ "Id": Guid, "Name": string, "Version": string,
 "LidarrConfigured": bool, "AudioMuseInstalled": bool, "AudioMuseEnabled": bool,
-"AudioMuseVersion": string | null }`. Used for server discovery and version negotiation.
+"AudioMuseVersion": string | null, "Features": string[] }`. Used for server discovery and
+version negotiation. `Features` names the optional APIs this build offers, so a client checks
+for one instead of comparing build numbers: `"playback"` (§3.20).
+Older builds send no `Features`; read its absence as none.
 `LidarrConfigured` is `true` when Lidarr's URL and API key are both set on the server
 *and*, when `LidarrRequireAdmin` is enabled, the calling user is a Jellyfin
 administrator. Anonymous callers always see `false` in the admin-gated case.
@@ -390,6 +393,7 @@ gating: **any auth** = any authenticated Jellyfin user; **request-gated** = admi
 | GET | `/rootfolders` | Lidarr `GET /rootfolder`. Used by the plugin config UI. | **admin** |
 | GET | `/qualityprofiles` | Lidarr `GET /qualityprofile`. | **admin** |
 | GET | `/metadataprofiles` | Lidarr `GET /metadataprofile`. | **admin** |
+| POST | `/probe` | Tries an **unsaved** Lidarr URL and key, so the plugin config UI can fill its dropdowns while the admin types. Body `{ "BaseUrl": <string>, "ApiKey": <string> }`. Always `200` with `{ "Status", "Message", "Version", "RootFolders", "QualityProfiles", "MetadataProfiles" }`; each list entry is `{ "Value", "Label" }` (folder path, or profile id as a string). `Status` is one of `Connected`, `InvalidUrl`, `MissingApiKey`, `Unreachable`, `TimedOut` (10 s), `Unauthorized`, `NotLidarr`, `UnexpectedResponse`; lists are empty unless `Connected`. Upstream error bodies are never passed through. | **admin** |
 
 **Album shape (from `GET /artists/{mbid}/albums`):**
 
@@ -714,6 +718,188 @@ act on that user's library there. It is minted from a random GUID (never derived
 server id or anything else guessable), is never written to the server log, and is only ever
 returned to the user it belongs to. Clients must store it like a token (e.g. Keychain), never
 log it, and never put it in URLs that might be logged.
+
+### 3.19 Listening history `/api/norisync/listens`
+
+JSON-only. One listening history per Jellyfin user, shared by all of the user's devices:
+each device **uploads the listens it made** and **reads the ones made on the others**. Every
+call reads or writes the caller's own history only. The device is the `DeviceId` of the
+request's Jellyfin authorization; a request without one is refused, since it could not be
+told apart from the devices it should hear from.
+
+A listen:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `Id` | string | The client's id for the listen (a UUID, ≤ 64 chars). Unique per user; the same on every device that holds the listen. |
+| `ItemId` | string | The audio item, a GUID in any standard format (served back compact, `N`). |
+| `PlayedAt` | int64 | When playback started, Unix **milliseconds**, on the listening device's clock. |
+| `ContextType` | string | What it was played from: `album`, `playlist`, `artist`, `station`, … (≤ 32 chars). |
+| `ContextId` | string? | The id of that album / playlist / artist when it is a server item; otherwise `null`. |
+| `DeviceId` | string | Responses only: the device that made the listen. Ignored on upload. |
+
+#### `POST /api/norisync/listens`
+
+Body `{ "Listens": [ … ] }`, at most **500** per request. Idempotent: a listen whose `Id`
+the user already has is left untouched, so a client simply retries a failed upload.
+
+Response `200`: `{ "Epoch": "…", "Accepted": 12 }` — `Accepted` counts the listens that
+were new.
+
+- `400` — more than 500 listens, a malformed listen (the whole request is refused), a
+  `PlayedAt` more than 24 h ahead of the server clock, or no device id.
+- `403` — the request isn't tied to a Jellyfin user. `503` — plugin not initialised.
+
+#### `GET /api/norisync/listens?since=<cursor>&limit=<n>`
+
+The caller's listens **made on other devices**, in the order the server stored them.
+`since` is the `NextSince` of the previous response (`0` the first time); `limit` defaults
+to and is capped at **1000**.
+
+```json
+{
+  "Epoch": "6f1d…",
+  "Listens": [ { "Id": "…", "ItemId": "…", "PlayedAt": 1794000000000, "ContextType": "album", "ContextId": "…", "DeviceId": "…" } ],
+  "NextSince": 4812,
+  "HasMore": false
+}
+```
+
+- **The cursor is a sequence number, not a time.** A listen made offline is uploaded long
+  after it happened and still arrives after the cursor. `NextSince` also steps over the
+  caller's own listens, so store it even when `Listens` is empty.
+- **`Epoch`** identifies the listen store and changes only if the store is lost or reset.
+  A client that sees a different epoch from the one it stored its cursor under must start
+  again from `since=0` **and re-upload all of its own listens** — that is how the devices
+  put a lost history back.
+- Listens are kept when their item is deleted; clients skip listens for items they don't
+  have. A deleted user's listens are removed by the orphan prune.
+
+Clients should treat `404` on either route as **"plugin too old"**.
+
+### 3.20 Playback sync `/api/norisync/playback`
+
+JSON-only, offered when `/info`'s `Features` holds `"playback"`. A user's devices share what each
+is playing, and one can take another's session over. The server holds one **record per device**
+(its session, where it is in it, what it is doing) and the **queues** those sessions name. Every
+time is the server's clock, Unix milliseconds: no device's clock is stored or compared. Every
+change of a record is **pushed** to the user's Nori sockets, so a client reads only to catch up.
+
+- A **session** is a queue's lineage, an id the client mints (1–64 of `A–Z a–z 0–9 - _`) when a
+  queue starts. Its **revision** (`QueueRev`) moves on at every edit of the queue. A queue is
+  immutable under its `(SessionId, QueueRev)`.
+- `403` when the request isn't tied to a Jellyfin user and device, `503` when the plugin isn't
+  initialised. A device not heard from in 30 days is forgotten; at most 16 are kept per user (the
+  least recently heard from go first). A deleted user's devices go with the orphan prune.
+
+#### `POST /api/norisync/playback/report`
+
+One report, in place of Jellyfin's `Sessions/Playing`, `Sessions/Playing/Progress` and
+`Sessions/Playing/Stopped`:
+
+```jsonc
+{
+  "Seq": 1794000123456,              // > 0, increasing per device
+  "Event": "Start",                  // Start | Progress | Stopped | Cursor
+  "SessionId": "3f9c…", "QueueRev": 4,
+  "Shareable": true,                 // optional, default true; false: never offered (a DJ session)
+  "Queue": { … } | null,             // the queue at this revision, a JSON object ≤ 262 144 chars
+  "EntryIndex": 12,                  // the current entry
+  "ItemId": "4f2a…",                 // the item
+  "PositionTicks": 1234000000,       // 10,000 per millisecond
+  "Status": "playing",               // playing | paused | stopped: the device after this report
+  "PlaySessionId": "…",              // optional, ≤ 128 characters
+  "PlayMethod": "DirectPlay",        // optional: DirectPlay | DirectStream | Transcode
+  "TakeOver": { "SessionId": "3f9c…" } // optional, with a playing Start only
+}
+```
+
+1. **Order.** A `Seq` at or below the device's last applied is stale: nothing is applied or passed
+   on, answered `200 {"Stale": true}`. (A `Seq` more than a day below is a device that started
+   counting again — clock moved back, reinstalled — and is applied.) Send reports one at a time.
+2. **The queue.** `Queue`, when present, is stored under `(SessionId, QueueRev)` unless that one is
+   stored already. Send it with the first report naming a revision the server hasn't acknowledged.
+3. **Take-over.** `TakeOver` moves the named session from whichever other device holds it now
+   (so of two devices taking the same session, the later start wins): that device's record loses
+   the session, reads paused, and records `MovedTo` (this device). The taker reports a new
+   `SessionId` of its own, never the taken one: until this lands the source may store revisions
+   of that session, and a queue already stored under a revision is kept. After the reply's record is
+   written, it is sent a Jellyfin WebSocket `Playstate` message with `Command: "Pause"` over every
+   socket it holds that has talked in the last 60 s, on the server's own timeout — never cancelled
+   with the request. No `SupportsMediaControl` is needed, so no client lists Nori as a cast target.
+4. **The record** becomes the report: session, revision, entry, item, position (true now), status.
+   Its `Version` moves on. It is pushed (below).
+5. **Jellyfin** then gets the event on the caller's session — found as Jellyfin's
+   `PlaystateController` finds it (`LogSessionActivity` from the request's client, version, device
+   and address) — as `PlaybackStartInfo` / `PlaybackProgressInfo` / `PlaybackStopInfo` with the
+   fields its own bodies carry (`IsPaused` = status isn't `playing`), so the dashboard, play counts
+   and other plugins see what they always saw. A `Stopped` with a `PlaySessionId` also ends that
+   play session's transcode. A `Cursor` (a move or queue change with no Jellyfin event: the queue's
+   end wrapping to its first track, Next while paused, a queue edit) is never passed on. As with
+   Jellyfin, an absent `PlayMethod` is `Transcode`, and `Transcode` with no transcoding job for the
+   `PlaySessionId` is passed on as `DirectPlay`.
+6. **A device whose session was taken over** and reports it again (the pause never reached it) gets
+   no session back: its record keeps its status and position, no session, and while it reports
+   `playing` it is answered `MovedTo` (it should pause). Reporting another session clears that.
+
+`204`, or `200 { "Stale": bool, "QueueNeeded": bool, "MovedTo": {"DeviceId", "DeviceName", "SessionId"} | null }`:
+`QueueNeeded` — the server holds no queue for the reported session and revision (send it, with a
+`Cursor` if no other report is due). `400` for a malformed body (unknown `Event` / `Status` /
+`PlayMethod`, a bad or missing `SessionId` or `ItemId`, a negative number, a `Queue` that isn't an
+object or is too long, a `TakeOver` without a playing `Start`).
+
+Send reports as they happen; don't replay them later (a late `Start` puts a stale item on the
+dashboard and can count a play twice beside the listen history, §3.19). Jellyfin stops a playing
+session it hasn't heard from in 5 minutes: while playing, send a `Progress` at least every 4.
+
+#### `GET /api/norisync/playback/devices`
+
+Every device of the user. `Cache-Control: no-store`.
+
+```jsonc
+{ "ServerNow": 1794000060000, "Version": 1794000059000,
+  "Devices": [ { "DeviceId", "DeviceName", "IsCaller", "SessionId" | null, "QueueRev" | null,
+                 "Shareable", "EntryIndex", "ItemId" (32 lowercase hex), "PositionTicks",
+                 "PositionAt", "Status", "Live", "UpdatedAt", "Version",
+                 "MovedTo": { "DeviceId", "DeviceName", "SessionId" } | null } ] }
+```
+
+`PositionAt`: when `PositionTicks` was true (a playing device has played on since by
+`ServerNow − PositionAt`). `UpdatedAt`: when the device last reported. `Live`: the device is
+playing and can be told to pause now — status `playing`, reported in the last 5 minutes, and it
+holds a Jellyfin WebSocket that has talked in the last 60 s (Jellyfin leaves a socket that stopped
+sending keep-alives open, so an open one alone proves nothing). A device with no `SessionId` holds
+nothing to offer. `Version`: moves on at every change of a record, never below the server's clock;
+a client keeps the higher of two copies of a record.
+
+#### `GET /api/norisync/playback/queue?session=<id>&rev=<n>`
+
+The queue as the device sent it (`application/json`), `Cache-Control: private, max-age=31536000,
+immutable`. `404` once no device's record names that revision.
+
+#### `DELETE /api/norisync/playback?session=<id>`
+
+The device stopped `<id>`: its session is cleared (status `stopped`) if it still holds it — one it
+no longer holds (taken over, replaced) is left alone. Pushed. `204` either way.
+
+#### Pushes
+
+After every change of a record, and whenever a playing device's `Live` flips (its socket opened,
+closed or fell silent; checked every 15 s), the record is sent to every Jellyfin WebSocket of the
+user whose client is `Nori` and which has talked in the last 60 s — the record's own device
+included — as a standard `GeneralCommand`:
+
+```jsonc
+{ "MessageType": "GeneralCommand",
+  "Data": { "Name": "SendString", "ControllingUserId": "…",
+            "Arguments": { "NoriSync": "playback.device",
+                           "Payload": "{…one device, as in GET devices…}",
+                           "ServerNow": "1794000060000" } } }
+```
+
+`IsCaller` in the payload is relative to the receiving socket's device. A device that finds its
+own record with `MovedTo` while it plays `MovedTo.SessionId` should pause. Pushes are best-effort: a
+client reads `devices` when its socket (re)connects, for what it missed.
 
 ---
 

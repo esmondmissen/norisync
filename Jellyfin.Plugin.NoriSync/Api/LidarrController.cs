@@ -988,6 +988,32 @@ public class LidarrController : ControllerBase
     public Task<IActionResult> MetadataProfiles()
         => ForwardJsonAsync(HttpMethod.Get, "metadataprofile", adminOnly: true);
 
+    /// <summary>
+    /// Tries a Lidarr URL and API key from the request body, without saving them, and returns
+    /// the root-folder and profile lists. Lets the configuration form fill its dropdowns while
+    /// the admin is still typing. Admin-only: it makes the server call the given URL.
+    /// </summary>
+    /// <param name="request">The URL and key to try.</param>
+    /// <returns>The probe outcome; connection failures are a 200 with a status, not an error.</returns>
+    [HttpPost("probe")]
+    [Consumes(MediaTypeNames.Application.Json)]
+    [Produces(MediaTypeNames.Application.Json)]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    public async Task<ActionResult<LidarrProbeResponse>> Probe([FromBody] LidarrProbeRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var user = GetJellyfinUser();
+        if (user == null || !IsAdministrator(user))
+        {
+            return Forbid();
+        }
+
+        return await _client.ProbeAsync(request.BaseUrl, request.ApiKey, HttpContext.RequestAborted).ConfigureAwait(false);
+    }
+
     private async Task<IActionResult> ForwardJsonAsync(
         HttpMethod method,
         string upstreamPath,

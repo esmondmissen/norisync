@@ -57,6 +57,13 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages, IDisposable
 
         var coverDesignLogger = loggerFactory.CreateLogger<PlaylistCoverDesignStore>();
         CoverDesignStore = new PlaylistCoverDesignStore(dataPath, coverDesignLogger);
+
+        var listenLogger = loggerFactory.CreateLogger<ListenHistoryStore>();
+        ListenStore = new ListenHistoryStore(dataPath, listenLogger);
+
+        // playbackstate.db held playback sync's first design, which never left development.
+        DeleteRetiredDatabase(dataPath, "playbackstate.db", loggerFactory.CreateLogger<Plugin>());
+        PlaybackStore = new PlaybackStore(dataPath, loggerFactory.CreateLogger<PlaybackStore>());
     }
 
     /// <inheritdoc />
@@ -112,6 +119,16 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages, IDisposable
     /// </summary>
     public PlaylistCoverDesignStore CoverDesignStore { get; }
 
+    /// <summary>
+    /// Gets the store of each user's listens, shared by all of their devices.
+    /// </summary>
+    public ListenHistoryStore ListenStore { get; }
+
+    /// <summary>
+    /// Gets the store of each user's devices for playback sync: their sessions and queues.
+    /// </summary>
+    public PlaybackStore PlaybackStore { get; }
+
     /// <inheritdoc />
     public IEnumerable<PluginPageInfo> GetPages()
     {
@@ -158,6 +175,8 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages, IDisposable
             AudioInfoStore.Dispose();
             AnimatedArtworkStore.Dispose();
             CoverDesignStore.Dispose();
+            ListenStore.Dispose();
+            PlaybackStore.Dispose();
         }
 
         _disposed = true;

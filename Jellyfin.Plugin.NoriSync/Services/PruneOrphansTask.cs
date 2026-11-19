@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
@@ -24,16 +25,19 @@ namespace Jellyfin.Plugin.NoriSync.Services;
 public class PruneOrphansTask : IScheduledTask
 {
     private readonly ILibraryManager _libraryManager;
+    private readonly IUserManager _userManager;
     private readonly ILogger<PruneOrphansTask> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PruneOrphansTask"/> class.
     /// </summary>
     /// <param name="libraryManager">The Jellyfin library manager.</param>
+    /// <param name="userManager">The Jellyfin user manager.</param>
     /// <param name="logger">Logger for this task.</param>
-    public PruneOrphansTask(ILibraryManager libraryManager, ILogger<PruneOrphansTask> logger)
+    public PruneOrphansTask(ILibraryManager libraryManager, IUserManager userManager, ILogger<PruneOrphansTask> logger)
     {
         _libraryManager = libraryManager;
+        _userManager = userManager;
         _logger = logger;
     }
 
@@ -44,7 +48,7 @@ public class PruneOrphansTask : IScheduledTask
     public string Key => "NoriSyncPruneOrphans";
 
     /// <inheritdoc />
-    public string Description => "Removes stored waveforms, cached audio info, animated artwork and playlist cover designs belonging to items that no longer exist in the library.";
+    public string Description => "Removes stored waveforms, cached audio info, animated artwork and playlist cover designs belonging to items that no longer exist in the library, and the listening history and playback state of deleted users.";
 
     /// <inheritdoc />
     public string Category => "NoriSync";
@@ -100,6 +104,9 @@ public class PruneOrphansTask : IScheduledTask
             plugin.CoverDesignStore.GetAllItemIds(),
             id => plugin.CoverDesignStore.Delete(id),
             cancellationToken);
+        progress.Report(95);
+
+        PruneDeletedUsers(plugin, cancellationToken);
         progress.Report(100);
 
         if (featureRows + audioInfoRows + artworkRows + coverDesignRows > 0)
@@ -129,6 +136,48 @@ public class PruneOrphansTask : IScheduledTask
             TimeOfDayTicks = TimeSpan.FromHours(4).Ticks,
             MaxRuntimeTicks = TimeSpan.FromMinutes(30).Ticks
         };
+    }
+
+    // Listens are kept when their ITEM goes: a library whose root moved is reissued new ids, and
+    // one re-added later would otherwise have lost its history. Only a deleted user's rows go.
+    private void PruneDeletedUsers(Plugin plugin, CancellationToken cancellationToken)
+    {
+        var listenUsers = plugin.ListenStore.GetAllUserIds();
+        var playbackUsers = plugin.PlaybackStore.GetAllUserIds();
+        var deleted = DeletedUsers(listenUsers.Concat(playbackUsers), _userManager.GetUserById);
+        if (deleted.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var userId in listenUsers.Where(deleted.Contains))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var removed = plugin.ListenStore.DeleteUser(userId);
+            _logger.LogInformation("Pruned {Count} listen(s) of deleted user {UserId}", removed, userId);
+        }
+
+        foreach (var userId in playbackUsers.Where(deleted.Contains))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            plugin.PlaybackStore.DeleteUser(userId);
+            _logger.LogInformation("Pruned the playback devices of deleted user {UserId}", userId);
+        }
+    }
+
+    /// <summary>
+    /// The stored users Jellyfin no longer has. As with items above, if NONE of them is found
+    /// the user store is taken to be unreadable, not every user deleted, and nothing is pruned.
+    /// (Jellyfin has no user listing common to 10.11 and 12, so the stored ids are the sample.)
+    /// </summary>
+    /// <param name="storedUserIds">Every user id the stores hold rows for.</param>
+    /// <param name="findUser">Jellyfin's user lookup.</param>
+    /// <returns>The ids to prune; empty when there are none, or when none was found.</returns>
+    internal static HashSet<Guid> DeletedUsers(IEnumerable<Guid> storedUserIds, Func<Guid, object?> findUser)
+    {
+        var stored = storedUserIds.ToHashSet();
+        var deleted = stored.Where(id => findUser(id) == null).ToHashSet();
+        return deleted.Count == stored.Count ? new HashSet<Guid>() : deleted;
     }
 
     private int Prune(string storeName, IReadOnlyList<Guid> storedIds, Action<Guid> delete, CancellationToken cancellationToken)

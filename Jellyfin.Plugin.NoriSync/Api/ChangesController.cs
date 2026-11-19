@@ -351,7 +351,9 @@ public class ChangesController : ControllerBase
             LidarrConfigured = lidarrConfigured,
             AudioMuseInstalled = audioMuse != null,
             AudioMuseEnabled = audioMuse?.IsEnabledAndSupported ?? false,
-            AudioMuseVersion = audioMuse?.Version.ToString()
+            AudioMuseVersion = audioMuse?.Version.ToString(),
+            // What this build's API offers, so a client needn't infer it from the version.
+            Features = new[] { PlaybackSyncController.Feature }
         });
     }
 
@@ -1412,68 +1414,7 @@ public class ChangesController : ControllerBase
     }
 
     private (Guid UserId, string? DeviceId, string? DeviceName, string? ClientName) GetClientIdentity()
-    {
-        var userIdClaim = User.FindFirstValue("Jellyfin-UserId")
-            ?? User.FindFirstValue(ClaimTypes.NameIdentifier);
-        var userId = Guid.TryParse(userIdClaim, out var parsed) ? parsed : Guid.Empty;
-
-        var deviceId = User.FindFirstValue("Jellyfin-DeviceId");
-        var deviceName = User.FindFirstValue("Jellyfin-Device");
-        var clientName = User.FindFirstValue("Jellyfin-Client");
-
-        if (string.IsNullOrEmpty(deviceId))
-        {
-            var authHeader = Request.Headers["X-Emby-Authorization"].ToString();
-            if (string.IsNullOrEmpty(authHeader))
-            {
-                authHeader = Request.Headers.Authorization.ToString();
-            }
-
-            ParseAuthHeader(authHeader, ref deviceId, ref deviceName, ref clientName);
-        }
-
-        return (userId, string.IsNullOrWhiteSpace(deviceId) ? null : deviceId, deviceName, clientName);
-    }
-
-    private static void ParseAuthHeader(string header, ref string? deviceId, ref string? deviceName, ref string? clientName)
-    {
-        if (string.IsNullOrEmpty(header))
-        {
-            return;
-        }
-
-        var schemeIndex = header.IndexOf(' ', StringComparison.Ordinal);
-        var payload = schemeIndex > 0 ? header[(schemeIndex + 1)..] : header;
-
-        foreach (var raw in payload.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var eq = raw.IndexOf('=', StringComparison.Ordinal);
-            if (eq <= 0)
-            {
-                continue;
-            }
-
-            var key = raw[..eq].Trim();
-            var value = raw[(eq + 1)..].Trim().Trim('"');
-            if (value.Length == 0)
-            {
-                continue;
-            }
-
-            if (string.IsNullOrEmpty(deviceId) && key.Equals("DeviceId", StringComparison.OrdinalIgnoreCase))
-            {
-                deviceId = value;
-            }
-            else if (string.IsNullOrEmpty(deviceName) && key.Equals("Device", StringComparison.OrdinalIgnoreCase))
-            {
-                deviceName = value;
-            }
-            else if (string.IsNullOrEmpty(clientName) && key.Equals("Client", StringComparison.OrdinalIgnoreCase))
-            {
-                clientName = value;
-            }
-        }
-    }
+        => RequestIdentity.Resolve(User, Request);
 
     private void TouchInstance()
     {

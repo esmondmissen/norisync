@@ -20,6 +20,8 @@
     <!-- The plugin references the Jellyfin packages compile-only (the host supplies them);
          ArtistNameLookup calls RemoveDiacritics, so the tests need its runtime assembly. -->
     <PackageReference Include="Jellyfin.Extensions" Version="10.11.0" />
+    <!-- DeviceSocketRegistryTests fakes IWebSocketConnection and reads PlaystateMessage. -->
+    <PackageReference Include="Jellyfin.Controller" Version="10.11.0" />
   </ItemGroup>
 
   <ItemGroup>
