@@ -26,11 +26,23 @@ public class LibraryChangeTracker : IHostedService, IDisposable
 {
     private const int FlushDelayMs = 5000;
     private const int ArtistResolutionDelayMs = 30000;
+    private const int RemovalSweepDelayMs = 15000;
+
+    // What a removed folder can hold. Playlists aren't: they link tracks, never contain them.
+    private static readonly (TrackedItemType Tracked, BaseItemKind Kind)[] FolderContentTypes =
+    {
+        (TrackedItemType.Track, BaseItemKind.Audio),
+        (TrackedItemType.Album, BaseItemKind.MusicAlbum),
+        (TrackedItemType.Artist, BaseItemKind.MusicArtist)
+    };
 
     private readonly ILibraryManager _libraryManager;
     private readonly IUserDataManager _userDataManager;
     private readonly IMemoryCache _memoryCache;
     private readonly ILogger<LibraryChangeTracker> _logger;
+    private readonly Func<ChangeTrackingStore?> _store;
+    private readonly int _flushDelayMs;
+    private readonly int _removalSweepDelayMs;
 
     private readonly object _bufferLock = new();
     private readonly Dictionary<Guid, ChangeRecord> _buffer = new();
@@ -46,6 +58,7 @@ public class LibraryChangeTracker : IHostedService, IDisposable
     private readonly object _artistResolutionLock = new();
     private Timer? _flushTimer;
     private Timer? _artistResolutionTimer;
+    private Timer? _removalSweepTimer;
     private bool _stopped;
     private bool _reconciling;
 
@@ -61,11 +74,27 @@ public class LibraryChangeTracker : IHostedService, IDisposable
         IUserDataManager userDataManager,
         IMemoryCache memoryCache,
         ILogger<LibraryChangeTracker> logger)
+        : this(libraryManager, userDataManager, memoryCache, logger, () => Plugin.Instance?.Store, FlushDelayMs, RemovalSweepDelayMs)
+    {
+    }
+
+    // Tests supply the store and short delays.
+    internal LibraryChangeTracker(
+        ILibraryManager libraryManager,
+        IUserDataManager userDataManager,
+        IMemoryCache memoryCache,
+        ILogger<LibraryChangeTracker> logger,
+        Func<ChangeTrackingStore?> store,
+        int flushDelayMs,
+        int removalSweepDelayMs)
     {
         _libraryManager = libraryManager;
         _userDataManager = userDataManager;
         _memoryCache = memoryCache;
         _logger = logger;
+        _store = store;
+        _flushDelayMs = flushDelayMs;
+        _removalSweepDelayMs = removalSweepDelayMs;
     }
 
     /// <inheritdoc />
@@ -171,6 +200,10 @@ public class LibraryChangeTracker : IHostedService, IDisposable
             // the last recorded resolution and catches up.
             _artistResolutionTimer?.Dispose();
             _artistResolutionTimer = null;
+
+            // Likewise a pending removal sweep: startup reconciliation finds the same items gone.
+            _removalSweepTimer?.Dispose();
+            _removalSweepTimer = null;
         }
 
         _libraryManager.ItemAdded -= OnItemAdded;
@@ -191,10 +224,29 @@ public class LibraryChangeTracker : IHostedService, IDisposable
         Enqueue(e.Item, ChangeType.Modified, fromUserData: false);
     }
 
-    private void OnItemRemoved(object? sender, ItemChangeEventArgs e)
+    internal void OnItemRemoved(object? sender, ItemChangeEventArgs e)
     {
         Enqueue(e.Item, ChangeType.Deleted, fromUserData: false);
+
+        if (MayHoldLibraryContent(e.Item))
+        {
+            ScheduleRemovalSweep();
+        }
     }
+
+    /// <summary>
+    /// Whether removing this item can take tracks, albums or artists with it unannounced.
+    /// </summary>
+    /// <remarks>
+    /// Jellyfin deletes a folder's recursive children in the same call as the folder and raises
+    /// <c>ItemRemoved</c> for the folder alone. A scan does that whenever a directory goes, and
+    /// whenever one changes type: an artist directory losing its last album turns into a plain
+    /// Folder, and the MusicArtist it was is removed with the albums and tracks under it.
+    /// </remarks>
+    /// <param name="item">The removed item.</param>
+    /// <returns>Whether a removal sweep should follow.</returns>
+    internal static bool MayHoldLibraryContent(BaseItem item)
+        => item is MusicArtist or MusicAlbum or CollectionFolder || item.GetType() == typeof(Folder);
 
     private void OnUserDataSaved(object? sender, UserDataSaveEventArgs e)
     {
@@ -265,7 +317,7 @@ public class LibraryChangeTracker : IHostedService, IDisposable
 
             if (_flushTimer == null)
             {
-                _flushTimer = new Timer(OnFlushTimer, null, FlushDelayMs, Timeout.Infinite);
+                _flushTimer = new Timer(OnFlushTimer, null, _flushDelayMs, Timeout.Infinite);
             }
         }
 
@@ -318,7 +370,7 @@ public class LibraryChangeTracker : IHostedService, IDisposable
             return;
         }
 
-        var store = Plugin.Instance?.Store;
+        var store = _store();
         if (store == null)
         {
             _logger.LogWarning("Dropping {Count} buffered changes; store unavailable", toFlush.Count);
@@ -475,7 +527,7 @@ public class LibraryChangeTracker : IHostedService, IDisposable
                 _pendingSnapshotOps.Clear();
             }
 
-            var store = Plugin.Instance?.Store;
+            var store = _store();
             if (store == null)
             {
                 return;
@@ -493,7 +545,7 @@ public class LibraryChangeTracker : IHostedService, IDisposable
 
     private void ReconcileOnStartup()
     {
-        var store = Plugin.Instance?.Store;
+        var store = _store();
         if (store == null)
         {
             return;
@@ -716,11 +768,152 @@ public class LibraryChangeTracker : IHostedService, IDisposable
 
     private void OnArtistResolutionTimer(object? state)
     {
-        var store = Plugin.Instance?.Store;
+        var store = _store();
         if (store != null)
         {
             ReconcileArtistResolution(store, isFirstRun: false);
         }
+    }
+
+    // A move or tidy-up removes folders in bursts, and a sweep reads every known id, so it waits
+    // for the burst to settle.
+    private void ScheduleRemovalSweep()
+    {
+        lock (_bufferLock)
+        {
+            if (_stopped)
+            {
+                return;
+            }
+
+            if (_removalSweepTimer == null)
+            {
+                _removalSweepTimer = new Timer(OnRemovalSweepTimer, null, _removalSweepDelayMs, Timeout.Infinite);
+            }
+            else
+            {
+                _removalSweepTimer.Change(_removalSweepDelayMs, Timeout.Infinite);
+            }
+        }
+    }
+
+    private void OnRemovalSweepTimer(object? state)
+    {
+        bool reconciling;
+        lock (_bufferLock)
+        {
+            if (_stopped)
+            {
+                return;
+            }
+
+            reconciling = _reconciling;
+        }
+
+        // Reconciliation rewrites the KnownItems this reads, and a running scan is still removing
+        // folders; either way, look again once it has settled.
+        if (reconciling || _libraryManager.IsScanRunning)
+        {
+            ScheduleRemovalSweep();
+            return;
+        }
+
+        var store = _store();
+        if (store == null)
+        {
+            return;
+        }
+
+        try
+        {
+            SweepSilentRemovals(store);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "NoriSync could not check a removed folder's contents; the next start reconciles them");
+        }
+    }
+
+    /// <summary>
+    /// Records a deletion for every known track, album and artist Jellyfin no longer has —
+    /// the contents a removed folder took with it (<see cref="MayHoldLibraryContent"/>).
+    /// </summary>
+    /// <remarks>
+    /// Startup reconciliation finds the same items; this records them without waiting for a
+    /// restart. A deletion that turns out wrong is harmless: Jellyfin can re-create an item under
+    /// the same id, and the sync feed lists only tombstones for items still gone.
+    /// </remarks>
+    /// <param name="store">The change store.</param>
+    /// <returns>How many deletions were queued.</returns>
+    internal int SweepSilentRemovals(ChangeTrackingStore store)
+    {
+        var gone = new List<(Guid ItemId, TrackedItemType ItemType)>();
+        foreach (var (trackedType, kind) in FolderContentTypes)
+        {
+            var known = store.GetKnownItems(trackedType);
+            if (known.Count == 0)
+            {
+                continue;
+            }
+
+            var live = _libraryManager.GetItemIds(new InternalItemsQuery
+            {
+                IncludeItemTypes = new[] { kind },
+                Recursive = true
+            }).ToHashSet();
+
+            gone.AddRange(known.Keys.Where(id => !live.Contains(id)).Select(id => (id, trackedType)));
+        }
+
+        if (gone.Count == 0)
+        {
+            return 0;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var queued = 0;
+        lock (_bufferLock)
+        {
+            if (_stopped)
+            {
+                return 0;
+            }
+
+            foreach (var (itemId, itemType) in gone)
+            {
+                // A buffered event is newer than the reads above: an add or update means the item
+                // is back, and a delete is already on its way.
+                if (_buffer.ContainsKey(itemId))
+                {
+                    continue;
+                }
+
+                _buffer[itemId] = new ChangeRecord
+                {
+                    ItemId = itemId,
+                    ItemName = string.Empty,
+                    ItemType = itemType,
+                    ChangeType = ChangeType.Deleted,
+                    Timestamp = now
+                };
+                _snapshotOps[itemId] = new SnapshotOp(itemType, null, isDelete: true);
+                queued++;
+            }
+
+            if (queued > 0 && _flushTimer == null)
+            {
+                _flushTimer = new Timer(OnFlushTimer, null, _flushDelayMs, Timeout.Infinite);
+            }
+        }
+
+        if (queued > 0)
+        {
+            _logger.LogInformation(
+                "NoriSync recorded {Count} deletions Jellyfin made without an event (the contents of a removed folder)",
+                queued);
+        }
+
+        return queued;
     }
 
     /// <summary>

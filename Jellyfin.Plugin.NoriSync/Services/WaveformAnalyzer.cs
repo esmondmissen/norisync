@@ -124,24 +124,18 @@ public static class WaveformAnalyzer
         ArgumentNullException.ThrowIfNull(samples);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sampleRate);
 
-        var fftSize = PickFftSize(sampleRate);
+        var frames = new FrameAnalysis(sampleRate);
+        var fftSize = frames.FftSize;
         if (samples.Length < fftSize)
         {
             return null;
         }
 
-        // Float-spaced frame stride preserves an exact 60 fps output rate for any input
-        // rate (e.g. 16000/60 = 266.67 — the int cast on each frame's startSample averages
-        // out to 60.0 fps). At 44.1 k this is exactly 735.0, matching the old int math.
-        var samplesPerFrame = sampleRate / AnalysisHz;
-        var totalFrames = (int)(samples.Length / samplesPerFrame);
+        var totalFrames = (int)(samples.Length / frames.SamplesPerFrame);
         if (totalFrames <= 0)
         {
             return null;
         }
-
-        var window = new double[fftSize];
-        FillHannWindow(window);
 
         var allBandEnergies = new float[totalFrames][];
         var spectrogram = new float[totalFrames][];
@@ -151,85 +145,28 @@ public static class WaveformAnalyzer
             spectrogram[i] = new float[HpssBinCount];
         }
 
-        var nyquist = sampleRate / 2f;
-        var binWidth = nyquist / (fftSize / 2f);
-        var fftScale = 1.0 / fftSize;
-
-        // Only magnitudes below the top band's max frequency are ever read — skip the rest.
-        var maxNeededBin = Math.Min(fftSize / 2, (int)(BandRanges[BandCount - 1].Max / binWidth) + 2);
-
         // ===== Pass 1: windowed FFT per frame → per-band energy + low-bin spectrogram =====
         // Parallelized across frames. Each thread gets its own FFT scratch buffers.
         Parallel.For(
             0,
             totalFrames,
-            () => (FrameBuffer: new double[fftSize], Magnitudes: new float[maxNeededBin]),
-            (frameIdx, _, local) =>
+            () => frames.NewScratch(),
+            (frameIdx, _, scratch) =>
             {
-                var frameBuffer = local.FrameBuffer;
-                var magnitudes = local.Magnitudes;
-
-                var startSample = (int)(frameIdx * samplesPerFrame);
-
-                // Center the FFT window on the frame, clamped to buffer bounds.
-                var centerOffset = ((int)samplesPerFrame - fftSize) / 2;
-                var idealReadStart = startSample + centerOffset;
-                var readStart = Math.Max(0, Math.Min(idealReadStart, samples.Length - fftSize));
-
-                for (var i = 0; i < fftSize; i++)
-                {
-                    frameBuffer[i] = samples[readStart + i] * window[i];
-                }
-
-                var spectrum = FFT.Forward(frameBuffer);
-
-                for (var b = 0; b < magnitudes.Length; b++)
-                {
-                    magnitudes[b] = (float)(spectrum[b].Magnitude * fftScale);
-                }
-
-                var bins = magnitudes.Length > HpssBinCount ? HpssBinCount : magnitudes.Length;
-                var spectRow = spectrogram[frameIdx];
-                for (var b = 0; b < bins; b++)
-                {
-                    spectRow[b] = magnitudes[b];
-                }
-
-                var bandRow = allBandEnergies[frameIdx];
-                for (var bandIdx = 0; bandIdx < BandCount; bandIdx++)
-                {
-                    var range = BandRanges[bandIdx];
-                    var lowerBin = (int)(range.Min / binWidth);
-                    var upperBin = (int)(range.Max / binWidth);
-                    var safeLower = Math.Max(0, Math.Min(lowerBin, magnitudes.Length - 1));
-                    var safeUpper = Math.Max(safeLower + 1, Math.Min(upperBin, magnitudes.Length));
-
-                    float peak = 0f;
-                    float sumSquares = 0f;
-                    var count = safeUpper - safeLower;
-                    for (var b = safeLower; b < safeUpper; b++)
-                    {
-                        var m = magnitudes[b];
-                        if (m > peak)
-                        {
-                            peak = m;
-                        }
-
-                        sumSquares += m * m;
-                    }
-
-                    var rms = count > 0 ? MathF.Sqrt(sumSquares / count) : 0f;
-                    // Peak captures transient snap, RMS captures sustained body.
-                    var bandEnergy = (0.6f * peak) + (0.4f * rms);
-                    bandEnergy *= FrequencyWeights[bandIdx];
-
-                    bandRow[bandIdx] = bandEnergy;
-                }
-
-                return local;
+                var readStart = Math.Max(0, Math.Min(frames.IdealReadStart(frameIdx), samples.Length - fftSize));
+                frames.Analyze(samples.AsSpan(readStart, fftSize), scratch, spectrogram[frameIdx], allBandEnergies[frameIdx]);
+                return scratch;
             },
             _ => { });
 
+        return FinishFrames(allBandEnergies, spectrogram, totalFrames);
+    }
+
+    /// <summary>
+    /// Everything after pass 1, which reads only the per-frame band energies and spectrogram.
+    /// </summary>
+    private static byte[] FinishFrames(float[][] allBandEnergies, float[][] spectrogram, int totalFrames)
+    {
         // ===== HPSS: harmonic-percussive separation on the low-bin spectrogram =====
         var percussive = PerformHpssPercussive(spectrogram, totalFrames, HpssBinCount);
 
@@ -760,5 +697,261 @@ public static class WaveformAnalyzer
         return (length % 2 == 0)
             ? (buffer[mid - 1] + buffer[mid]) / 2f
             : buffer[mid];
+    }
+
+    /// <summary>
+    /// The waveform of a track fed in pieces, as its decode arrives: each frame is analysed as
+    /// soon as its window is in, and only the samples later frames can still read are kept,
+    /// so memory doesn't grow with the track (a multi-hour mix held whole ran a server out of
+    /// memory). Gives exactly what <see cref="Analyze"/> gives on the same samples.
+    /// </summary>
+    internal sealed class Accumulator
+    {
+        private const int BatchFrames = 512;
+
+        private readonly FrameAnalysis _frames;
+        private readonly List<float[]> _bandRows = new();
+        private readonly List<float[]> _spectRows = new();
+        private float[] _buffer;
+        private int _count;
+        private long _bufferStart;
+        private long _received;
+        private int _nextFrame;
+        private int _readyFrame;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Accumulator"/> class.
+        /// </summary>
+        /// <param name="sampleRate">Sample rate of the samples to come, in Hz.</param>
+        public Accumulator(int sampleRate)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sampleRate);
+            _frames = new FrameAnalysis(sampleRate);
+            _buffer = new float[_frames.FftSize * 4];
+        }
+
+        /// <summary>
+        /// Feeds the next samples of the track.
+        /// </summary>
+        /// <param name="samples">Mono PCM, in order.</param>
+        public void Append(ReadOnlySpan<float> samples)
+        {
+            // The frame arithmetic is the in-memory analyser's, on int sample indices.
+            if (_received + samples.Length > int.MaxValue)
+            {
+                throw new InvalidOperationException("Track too long for waveform analysis");
+            }
+
+            EnsureRoom(samples.Length);
+            samples.CopyTo(_buffer.AsSpan(_count));
+            _count += samples.Length;
+            _received += samples.Length;
+
+            // Frames that exist whatever the final length, with their whole window in.
+            var exist = (int)((int)_received / _frames.SamplesPerFrame);
+            while (_readyFrame < exist && _frames.IdealReadStart(_readyFrame) + _frames.FftSize <= _received)
+            {
+                _readyFrame++;
+            }
+
+            if (_readyFrame - _nextFrame >= BatchFrames)
+            {
+                Process(_readyFrame, length: null);
+            }
+        }
+
+        /// <summary>
+        /// The waveform of everything fed.
+        /// </summary>
+        /// <returns>The blob, or null as <see cref="Analyze"/> returns it.</returns>
+        public byte[]? Finish()
+        {
+            var length = (int)_received;
+            if (length < _frames.FftSize)
+            {
+                return null;
+            }
+
+            var totalFrames = (int)(length / _frames.SamplesPerFrame);
+            if (totalFrames <= 0)
+            {
+                return null;
+            }
+
+            Process(totalFrames, length);
+            return FinishFrames(_bandRows.ToArray(), _spectRows.ToArray(), totalFrames);
+        }
+
+        /// <summary>
+        /// Analyses frames up to <paramref name="endFrame"/>. <paramref name="length"/>: the
+        /// track's final length, once known (the last frames' windows are clamped to it).
+        /// </summary>
+        private void Process(int endFrame, int? length)
+        {
+            var from = _nextFrame;
+            if (endFrame <= from)
+            {
+                return;
+            }
+
+            var bands = new float[endFrame - from][];
+            var spects = new float[endFrame - from][];
+            for (var i = 0; i < bands.Length; i++)
+            {
+                bands[i] = new float[BandCount];
+                spects[i] = new float[HpssBinCount];
+            }
+
+            var frames = _frames;
+            var buffer = _buffer;
+            var bufferStart = _bufferStart;
+            var fftSize = frames.FftSize;
+            Parallel.For(
+                from,
+                endFrame,
+                () => frames.NewScratch(),
+                (frameIdx, _, scratch) =>
+                {
+                    var ideal = frames.IdealReadStart(frameIdx);
+                    var readStart = length is int len ? Math.Max(0, Math.Min(ideal, len - fftSize)) : Math.Max(0, ideal);
+                    frames.Analyze(buffer.AsSpan((int)(readStart - bufferStart), fftSize), scratch, spects[frameIdx - from], bands[frameIdx - from]);
+                    return scratch;
+                },
+                _ => { });
+
+            _bandRows.AddRange(bands);
+            _spectRows.AddRange(spects);
+            _nextFrame = endFrame;
+            _readyFrame = Math.Max(_readyFrame, endFrame);
+            Trim();
+        }
+
+        /// <summary>
+        /// Drops the samples no later frame can read: before the next frame's window, but never
+        /// the last window's worth (a short track clamps its last frames back onto them).
+        /// </summary>
+        private void Trim()
+        {
+            var keepFrom = Math.Min(Math.Max(0L, _frames.IdealReadStart(_nextFrame)), Math.Max(0L, _received - _frames.FftSize));
+            var drop = (int)(keepFrom - _bufferStart);
+            if (drop <= 0)
+            {
+                return;
+            }
+
+            Array.Copy(_buffer, drop, _buffer, 0, _count - drop);
+            _count -= drop;
+            _bufferStart = keepFrom;
+        }
+
+        private void EnsureRoom(int incoming)
+        {
+            if (_count + incoming <= _buffer.Length)
+            {
+                return;
+            }
+
+            Trim();
+            if (_count + incoming > _buffer.Length)
+            {
+                Array.Resize(ref _buffer, Math.Max(_buffer.Length * 2, _count + incoming));
+            }
+        }
+    }
+
+    /// <summary>
+    /// One frame of pass 1: a Hann-windowed FFT → five band energies and the low-bin
+    /// spectrogram row. Shared by the in-memory and the streamed analysis.
+    /// </summary>
+    private sealed class FrameAnalysis
+    {
+        private readonly double[] _window;
+        private readonly int _centerOffset;
+        private readonly float _binWidth;
+        private readonly double _fftScale;
+        private readonly int _maxNeededBin;
+
+        public FrameAnalysis(int sampleRate)
+        {
+            FftSize = PickFftSize(sampleRate);
+            _window = new double[FftSize];
+            FillHannWindow(_window);
+
+            // Float-spaced frame stride preserves an exact 60 fps output rate for any input
+            // rate (e.g. 16000/60 = 266.67 — the int cast on each frame's startSample averages
+            // out to 60.0 fps). At 44.1 k this is exactly 735.0, matching the old int math.
+            SamplesPerFrame = sampleRate / AnalysisHz;
+
+            // Center the FFT window on the frame.
+            _centerOffset = ((int)SamplesPerFrame - FftSize) / 2;
+
+            var nyquist = sampleRate / 2f;
+            _binWidth = nyquist / (FftSize / 2f);
+            _fftScale = 1.0 / FftSize;
+
+            // Only magnitudes below the top band's max frequency are ever read — skip the rest.
+            _maxNeededBin = Math.Min(FftSize / 2, (int)(BandRanges[BandCount - 1].Max / _binWidth) + 2);
+        }
+
+        public int FftSize { get; }
+
+        public float SamplesPerFrame { get; }
+
+        public int IdealReadStart(int frameIdx) => (int)(frameIdx * SamplesPerFrame) + _centerOffset;
+
+        public (double[] FrameBuffer, float[] Magnitudes) NewScratch() => (new double[FftSize], new float[_maxNeededBin]);
+
+        public void Analyze(ReadOnlySpan<float> samples, (double[] FrameBuffer, float[] Magnitudes) scratch, float[] spectRow, float[] bandRow)
+        {
+            var frameBuffer = scratch.FrameBuffer;
+            var magnitudes = scratch.Magnitudes;
+            for (var i = 0; i < FftSize; i++)
+            {
+                frameBuffer[i] = samples[i] * _window[i];
+            }
+
+            var spectrum = FFT.Forward(frameBuffer);
+
+            for (var b = 0; b < magnitudes.Length; b++)
+            {
+                magnitudes[b] = (float)(spectrum[b].Magnitude * _fftScale);
+            }
+
+            var bins = magnitudes.Length > HpssBinCount ? HpssBinCount : magnitudes.Length;
+            for (var b = 0; b < bins; b++)
+            {
+                spectRow[b] = magnitudes[b];
+            }
+
+            for (var bandIdx = 0; bandIdx < BandCount; bandIdx++)
+            {
+                var range = BandRanges[bandIdx];
+                var lowerBin = (int)(range.Min / _binWidth);
+                var upperBin = (int)(range.Max / _binWidth);
+                var safeLower = Math.Max(0, Math.Min(lowerBin, magnitudes.Length - 1));
+                var safeUpper = Math.Max(safeLower + 1, Math.Min(upperBin, magnitudes.Length));
+
+                float peak = 0f;
+                float sumSquares = 0f;
+                var count = safeUpper - safeLower;
+                for (var b = safeLower; b < safeUpper; b++)
+                {
+                    var m = magnitudes[b];
+                    if (m > peak)
+                    {
+                        peak = m;
+                    }
+
+                    sumSquares += m * m;
+                }
+
+                var rms = count > 0 ? MathF.Sqrt(sumSquares / count) : 0f;
+                // Peak captures transient snap, RMS captures sustained body.
+                var bandEnergy = (0.6f * peak) + (0.4f * rms);
+                bandEnergy *= FrequencyWeights[bandIdx];
+
+                bandRow[bandIdx] = bandEnergy;
+            }
+        }
     }
 }

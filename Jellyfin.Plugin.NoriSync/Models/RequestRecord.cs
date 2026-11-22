@@ -13,7 +13,14 @@ public sealed class RequestRecord
     public Guid JellyfinUserId { get; set; }
 
     /// <summary>
-    /// Gets or sets the numeric Lidarr album id assigned after the album was added.
+    /// Gets or sets the service the request went to. Filled from the store the row was read
+    /// from; never stored in a row.
+    /// </summary>
+    public RequestBackend Backend { get; set; }
+
+    /// <summary>
+    /// Gets or sets the album id <see cref="Backend"/> assigned after the album was added (a
+    /// Lidarr id, or SoulSync's Lidarr-compatible id).
     /// </summary>
     public int LidarrAlbumId { get; set; }
 
@@ -57,4 +64,31 @@ public sealed class RequestRecord
     /// Gets or sets the most recent error message from Lidarr's queue, when applicable.
     /// </summary>
     public string? LastError { get; set; }
+
+    /// <summary>
+    /// Gets or sets where the plugin's search for the album stands, or null when it has no
+    /// schedule yet. Read from the album's <see cref="AlbumSearchRecord"/>; never written by
+    /// <see cref="Services.RequestsStore.Upsert"/>.
+    /// </summary>
+    public AlbumSearchState? SearchState { get; set; }
+
+    /// <summary>
+    /// Gets or sets how many searches have run in the current retry window.
+    /// </summary>
+    public int? SearchAttempts { get; set; }
+
+    /// <summary>
+    /// Gets or sets when the last search was sent.
+    /// </summary>
+    public DateTimeOffset? LastSearchedAt { get; set; }
+
+    /// <summary>
+    /// Gets or sets when the next search is due; null when none is scheduled.
+    /// </summary>
+    public DateTimeOffset? NextSearchAt { get; set; }
+
+    /// <summary>
+    /// Gets or sets Lidarr's last message about the search.
+    /// </summary>
+    public string? LastSearchMessage { get; set; }
 }

@@ -22,6 +22,9 @@ services.
 - **Waveform analysis** — runs a local waveform analyzer over every audio file
   (5-band 30 Hz visualizer stream) and persists it to a local SQLite database.
   Clients pull it via the waveform sync endpoint to drive on-device animation.
+  The same decode yields a 48-byte beat descriptor per track (tempo, beat phase,
+  bar phase and outro over the first 60 s and last 90 s) for beat-synced
+  crossfades, delivered on the same feed (`API_FORMAT.md` §4.11).
 
 ## Requirements
 
@@ -72,10 +75,29 @@ through the plugin. Inactive until both the base URL and API key are set.
 | --- | --- | --- |
 | `LidarrBaseUrl` | *(empty)* | Lidarr instance URL, e.g. `http://lidarr:8686`. Empty disables the integration |
 | `LidarrApiKey` | *(empty)* | Sent as `X-Api-Key` on every upstream call |
-| `LidarrRequireAdmin` | `true` | Require an administrator account for write actions (artist/album requests). Search and cover lookups are always available to authenticated users |
+| `LidarrRequireAdmin` | `true` | Require an administrator account for requests — albums and artists (Lidarr or SoulSync) and songs (SoulSync). Search and cover lookups are always available to authenticated users |
 | `LidarrRootFolderPath` | *(empty)* | Root folder used when adding new artists; picked from Lidarr's `/rootfolder` list in the config UI |
 | `LidarrQualityProfileId` | `0` | Quality profile used when adding new artists/albums; picked in the config UI |
 | `LidarrMetadataProfileId` | `0` | Metadata profile used when adding new artists; picked in the config UI |
+
+### SoulSync integration
+
+Optional. [SoulSync](https://github.com/Nezreka/SoulSync) downloads single songs as well as
+albums, so users can request one track instead of Lidarr's whole album. Songs go onto
+SoulSync's wishlist, which tags, files and imports them, asks Jellyfin to scan, and tries
+again on its own when nothing is found. Inactive until the URL and API key are set.
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `SoulSyncBaseUrl` | *(empty)* | SoulSync URL, e.g. `http://soulsync:8008`. Empty disables it |
+| `SoulSyncApiKey` | *(empty)* | An **admin** key (`sk_…`, SoulSync › Settings › SoulSync API › Generate API Key). A read-only key can't add anything |
+| `SoulSyncProfileId` | `1` | The SoulSync profile whose wishlist song requests land on; its request limit and permissions apply. Picked in the config UI |
+| `SoulSyncAlbumsEnabled` | `false` | Whether SoulSync takes album requests. Set by the config UI when SoulSync's **Lidarr-compatible API** answers — turn that on in SoulSync's settings (it is off by default) to request albums through SoulSync |
+| `AlbumRequestBackend` | `Lidarr` | With both Lidarr and SoulSync set up for albums, where new album requests go. Requests already made finish where they went |
+
+Album requests through SoulSync use its Lidarr-compatible API, so they work like Lidarr's
+except for the interactive release picker (SoulSync has no release list). Song requests
+need only SoulSync's own API. See `API_FORMAT.md` §3.16 and §3.21.
 
 ### Animated artwork
 
@@ -274,9 +296,10 @@ won't reinstall.
 ## Background tasks
 
 - **NoriSync: Analyze Waveforms** — daily at 03:00 by default.
-  Decodes each audio file via ffmpeg and runs the waveform analyzer over the
-  PCM buffer. Tracks whose `mtime` and analyzer version match the cached row are
-  skipped, so re-runs are cheap.
+  Decodes each audio file via ffmpeg and runs the waveform analyzer and the beat
+  descriptor over the PCM buffer. Tracks whose `mtime` and both analyzer versions
+  match the cached row are skipped, so re-runs are cheap (a version bump re-analyses
+  the library once).
 - **NoriSync: Purge Expired Changes** — daily at 03:30 by default.
   Drops change records older than the retention window, capped by the oldest
   acknowledged client cursor.
@@ -298,6 +321,15 @@ and the new ones as additions, which nets out correctly — provided the client 
 on the delta path and applies the tombstones. A client that instead re-enters
 through the full-sync path without clearing local state first will hold both
 copies. See the warning under *Handling cursor expiry* above.
+
+**Jellyfin announces a removed folder, never what was in it.** It deletes a folder's
+tracks, albums and artists in the same call as the folder and raises `ItemRemoved` for
+the folder alone — when a directory is moved or deleted, and when one changes type (an
+artist directory that loses its last album becomes a plain folder). So after any
+artist, album, plain-folder or library removal the plugin waits 15 s for the burst to
+settle (and for a running scan to finish), then records a deletion for every known
+track, album and artist Jellyfin no longer has. Startup reconciliation finds the same
+items; this sweep only stops them waiting for a restart.
 
 After such a move, expect the waveform task to re-analyse the library: the stored
 rows are keyed by item id, so they are orphaned by the move and cleared by the

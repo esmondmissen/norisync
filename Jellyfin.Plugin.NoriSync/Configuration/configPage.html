@@ -162,7 +162,7 @@
                                         <input id="LidarrRequireAdmin" name="LidarrRequireAdmin" type="checkbox" is="emby-checkbox" />
                                         <span>Restrict requests to administrators</span>
                                     </label>
-                                    <div class="fieldDescription">When enabled, only Jellyfin admins can submit album or artist requests. Search and cover lookups remain available to any authenticated user.</div>
+                                    <div class="fieldDescription">When enabled, only Jellyfin admins can submit requests: albums and artists (Lidarr or SoulSync) and songs (SoulSync). Search and cover lookups remain available to any authenticated user.</div>
                                 </div>
 
                                 <div class="selectContainer">
@@ -184,6 +184,57 @@
                                         Default metadata profile applied to new artists. These three lists load from Lidarr
                                         as soon as the URL and key connect; while Lidarr isn't connected, saving keeps the
                                         choices already saved.
+                                    </div>
+                                </div>
+                            </div>
+                        </details>
+
+                        <details class="nsSection" id="SectionSoulSync">
+                            <summary><h2>SoulSync</h2><span class="nsBadge" id="SoulSyncBadge"></span></summary>
+                            <div class="nsSectionBody">
+                                <p class="fieldDescription nsIntro">
+                                    SoulSync downloads single songs as well as albums, so users can request one track
+                                    instead of a whole album. Songs go onto SoulSync's wishlist, which tags, files and
+                                    imports them and tries again on its own when nothing is found.
+                                </p>
+
+                                <div class="inputContainer">
+                                    <label class="inputLabel inputLabelUnfocused" for="SoulSyncBaseUrl">SoulSync URL</label>
+                                    <input id="SoulSyncBaseUrl" name="SoulSyncBaseUrl" type="url" is="emby-input" placeholder="http://soulsync:8008" autocomplete="off" spellcheck="false" />
+                                    <div class="fieldDescription">Base URL of a SoulSync instance reachable from the Jellyfin server. Leave empty to disable.</div>
+                                </div>
+
+                                <div class="inputContainer">
+                                    <label class="inputLabel inputLabelUnfocused" for="SoulSyncApiKey">SoulSync API Key</label>
+                                    <input id="SoulSyncApiKey" name="SoulSyncApiKey" type="text" is="emby-input" class="nsMasked" autocomplete="off" spellcheck="false" />
+                                    <div class="fieldDescription">
+                                        An admin key (sk_…), made in SoulSync under Settings → SoulSync API → Generate API Key.
+                                        A read-only key can't add anything.
+                                        <button type="button" class="nsLinkButton" id="SoulSyncApiKeyToggle" style="display:none">Show key</button>
+                                    </div>
+                                </div>
+
+                                <div id="SoulSyncConnectionStatus" class="fieldDescription nsConnection" aria-live="polite"></div>
+                                <div id="SoulSyncAlbumsStatus" class="fieldDescription nsConnection" aria-live="polite"></div>
+
+                                <div class="selectContainer">
+                                    <label class="selectLabel" for="SoulSyncProfileId">Wishlist Profile</label>
+                                    <select id="SoulSyncProfileId" name="SoulSyncProfileId" is="emby-select"></select>
+                                    <div class="fieldDescription">
+                                        The SoulSync profile whose wishlist song requests land on; its request limits apply.
+                                        Album requests use the profile set in SoulSync's Lidarr-compatible API settings.
+                                    </div>
+                                </div>
+
+                                <div class="selectContainer" id="AlbumRequestBackendRow" style="display:none">
+                                    <label class="selectLabel" for="AlbumRequestBackend">Album requests go to</label>
+                                    <select id="AlbumRequestBackend" name="AlbumRequestBackend" is="emby-select">
+                                        <option value="Lidarr">Lidarr</option>
+                                        <option value="SoulSync">SoulSync</option>
+                                    </select>
+                                    <div class="fieldDescription">
+                                        Both Lidarr and SoulSync can take album requests. New ones go here; requests already
+                                        made finish where they went. Songs always go to SoulSync.
                                     </div>
                                 </div>
                             </div>
@@ -557,19 +608,140 @@
 
             // Masking uses -webkit-text-security; where a browser lacks it the key just shows, as
             // before, and there is nothing to toggle.
-            (function setUpKeyToggle() {
+            function setUpKeyToggle(inputId, toggleId) {
                 if (!window.CSS || !CSS.supports('-webkit-text-security', 'disc')) {
-                    el('#LidarrApiKey').classList.remove('nsMasked');
+                    el(inputId).classList.remove('nsMasked');
                     return;
                 }
 
-                var toggle = el('#LidarrApiKeyToggle');
+                var toggle = el(toggleId);
                 toggle.style.display = '';
                 toggle.addEventListener('click', function () {
-                    var masked = el('#LidarrApiKey').classList.toggle('nsMasked');
+                    var masked = el(inputId).classList.toggle('nsMasked');
                     toggle.textContent = masked ? 'Show key' : 'Hide key';
                 });
-            })();
+            }
+
+            setUpKeyToggle('#LidarrApiKey', '#LidarrApiKeyToggle');
+            setUpKeyToggle('#SoulSyncApiKey', '#SoulSyncApiKeyToggle');
+
+            // ---- SoulSync ---------------------------------------------------------------
+
+            // Same shape as Lidarr's: probe as typed, keep the saved profile while not connected.
+            // `albums` is whether its Lidarr-compatible API answered, saved as SoulSyncAlbumsEnabled.
+            var soulsync = {
+                seq: 0,
+                timer: null,
+                lastProbed: null,
+                connected: false,
+                albums: false,
+                wanted: { profile: '1' }
+            };
+
+            function setStatus(id, state, message) {
+                var status = el(id);
+                status.textContent = message || '';
+                if (!message || state === 'idle' || state === 'checking') {
+                    status.removeAttribute('data-state');
+                } else {
+                    status.setAttribute('data-state', state);
+                }
+            }
+
+            // The album choice matters only when both could take albums.
+            function updateAlbumBackendRow() {
+                var lidarrSet = el('#LidarrBaseUrl').value.trim() !== '' && el('#LidarrApiKey').value.trim() !== '';
+                el('#AlbumRequestBackendRow').style.display = lidarrSet && soulsync.connected && soulsync.albums ? '' : 'none';
+            }
+
+            function showSoulSync(state, badge, message, result) {
+                if (state !== 'checking') {
+                    soulsync.connected = state === 'ok';
+                    soulsync.albums = soulsync.connected && result && result.AlbumsAvailable === true;
+                }
+
+                setBadge('SoulSyncBadge', badge, state === 'idle' ? null : state);
+                setStatus('#SoulSyncConnectionStatus', state, message);
+                if (state === 'checking') {
+                    return;
+                }
+
+                setStatus('#SoulSyncAlbumsStatus', soulsync.albums ? 'ok' : 'warn',
+                    !soulsync.connected ? '' : soulsync.albums ? 'Albums: SoulSync\'s Lidarr-compatible API is on.' : (result.AlbumsMessage || 'Albums aren\'t available.'));
+                fillLidarrSelect(el('#SoulSyncProfileId'), soulsync.connected ? result.Profiles : null, soulsync.wanted.profile);
+                if (!soulsync.connected) {
+                    el('#SoulSyncProfileId').options[0].textContent = 'Connect to SoulSync to choose';
+                }
+
+                updateAlbumBackendRow();
+            }
+
+            function probeSoulSync(force) {
+                clearTimeout(soulsync.timer);
+
+                var url = el('#SoulSyncBaseUrl').value.trim();
+                var key = el('#SoulSyncApiKey').value.trim();
+                var probed = url + '\n' + key;
+                if (!force && probed === soulsync.lastProbed) {
+                    return Promise.resolve();
+                }
+
+                soulsync.lastProbed = probed;
+                var seq = ++soulsync.seq;
+
+                if (!url && !key) {
+                    showSoulSync('idle', 'Not set up', '');
+                    return Promise.resolve();
+                }
+
+                if (!url || !key) {
+                    showSoulSync('idle', 'Not connected', url ? 'Enter the API key to connect.' : 'Enter the SoulSync URL to connect.');
+                    return Promise.resolve();
+                }
+
+                showSoulSync('checking', 'Checking…', 'Connecting to SoulSync…');
+
+                return ApiClient.ajax({
+                    type: 'POST',
+                    url: ApiClient.getUrl('api/norisync/soulsync/probe'),
+                    data: JSON.stringify({ BaseUrl: url, ApiKey: key }),
+                    contentType: 'application/json',
+                    dataType: 'json'
+                }).then(function (result) {
+                    if (seq !== soulsync.seq) {
+                        return;
+                    }
+
+                    if (result.Status === 'Connected') {
+                        showSoulSync('ok', result.AlbumsAvailable ? 'Songs & albums' : 'Songs', 'Connected to SoulSync.', result);
+                    } else {
+                        showSoulSync('error', 'Not connected', result.Message || 'Couldn\'t connect to SoulSync.', result);
+                    }
+                }).catch(function () {
+                    if (seq !== soulsync.seq) {
+                        return;
+                    }
+
+                    soulsync.lastProbed = null;
+                    showSoulSync('error', 'Not connected', 'Couldn\'t check the connection: the Jellyfin server didn\'t answer.', null);
+                });
+            }
+
+            ['#SoulSyncBaseUrl', '#SoulSyncApiKey'].forEach(function (s) {
+                el(s).addEventListener('input', function () {
+                    clearTimeout(soulsync.timer);
+                    soulsync.timer = setTimeout(function () { probeSoulSync(false); }, 700);
+                });
+                el(s).addEventListener('change', function () { probeSoulSync(false); });
+            });
+
+            ['#LidarrBaseUrl', '#LidarrApiKey'].forEach(function (s) {
+                el(s).addEventListener('input', updateAlbumBackendRow);
+            });
+
+            el('#SoulSyncProfileId').addEventListener('change', function () {
+                soulsync.wanted.profile = this.value;
+            });
 
             // ---- Animated artwork quality ------------------------------------------------
 
@@ -612,6 +784,10 @@
                         quality: config.LidarrQualityProfileId || '',
                         metadata: config.LidarrMetadataProfileId || ''
                     };
+                    el('#SoulSyncBaseUrl').value = config.SoulSyncBaseUrl || '';
+                    el('#SoulSyncApiKey').value = config.SoulSyncApiKey || '';
+                    soulsync.wanted = { profile: String(config.SoulSyncProfileId || 1) };
+                    el('#AlbumRequestBackend').value = config.AlbumRequestBackend === 'SoulSync' ? 'SoulSync' : 'Lidarr';
                     el('#AnimatedArtworkEnabled').checked = config.AnimatedArtworkEnabled !== false;
                     var target = config.AnimatedArtworkTargetResolution != null ? config.AnimatedArtworkTargetResolution : 1080;
                     el('#AnimatedArtworkTargetResolution').value = target;
@@ -629,6 +805,7 @@
                     // Don't hold the loading spinner on Lidarr: the section shows its own progress.
                     Dashboard.hideLoadingMsg();
                     probeLidarr(true);
+                    probeSoulSync(true);
                 }).catch(function () {
                     Dashboard.hideLoadingMsg();
                 });
@@ -650,6 +827,17 @@
                         config.LidarrQualityProfileId = parseInt(el('#LidarrQualityProfileId').value, 10) || 0;
                         config.LidarrMetadataProfileId = parseInt(el('#LidarrMetadataProfileId').value, 10) || 0;
                     }
+                    config.SoulSyncBaseUrl = el('#SoulSyncBaseUrl').value.trim();
+                    config.SoulSyncApiKey = el('#SoulSyncApiKey').value.trim();
+                    // As with Lidarr's lists: unconnected, keep what was saved.
+                    if (soulsync.connected) {
+                        config.SoulSyncProfileId = parseInt(el('#SoulSyncProfileId').value, 10) || 1;
+                        config.SoulSyncAlbumsEnabled = soulsync.albums;
+                    }
+                    if (!config.SoulSyncBaseUrl || !config.SoulSyncApiKey) {
+                        config.SoulSyncAlbumsEnabled = false;
+                    }
+                    config.AlbumRequestBackend = el('#AlbumRequestBackend').value;
                     config.AnimatedArtworkEnabled = el('#AnimatedArtworkEnabled').checked;
                     config.AnimatedArtworkTargetResolution = parseInt(el('#AnimatedArtworkTargetResolution').value, 10) || 0;
                     config.AppleArtworkBackfillEnabled = el('#AppleArtworkBackfillEnabled').checked;

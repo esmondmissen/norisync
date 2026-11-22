@@ -1,3 +1,4 @@
+using Jellyfin.Plugin.NoriSync.Models;
 using MediaBrowser.Model.Plugins;
 
 namespace Jellyfin.Plugin.NoriSync.Configuration;
@@ -21,6 +22,11 @@ public class PluginConfiguration : BasePluginConfiguration
         LidarrApiKey = string.Empty;
         LidarrRequireAdmin = true;
         LidarrRootFolderPath = string.Empty;
+
+        SoulSyncBaseUrl = string.Empty;
+        SoulSyncApiKey = string.Empty;
+        SoulSyncProfileId = 1;
+        AlbumRequestBackend = RequestBackend.Lidarr;
 
         AnimatedArtworkEnabled = true;
         AnimatedArtworkTargetResolution = 1080;
@@ -66,9 +72,10 @@ public class PluginConfiguration : BasePluginConfiguration
     public string LidarrApiKey { get; set; }
 
     /// <summary>
-    /// Gets or sets a value indicating whether Lidarr write actions (album/artist requests)
-    /// require an administrator account. When false, any authenticated Jellyfin user can submit
-    /// requests. Search and cover lookups are always available to authenticated users.
+    /// Gets or sets a value indicating whether requests (albums and artists on Lidarr or SoulSync,
+    /// songs on SoulSync) require an administrator account. When false, any authenticated
+    /// Jellyfin user can submit requests. Search and cover lookups are always available to
+    /// authenticated users. Named for Lidarr, the first backend, so saved configs keep it.
     /// </summary>
     public bool LidarrRequireAdmin { get; set; }
 
@@ -87,6 +94,39 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Gets or sets the metadata profile id used when adding new artists to Lidarr.
     /// </summary>
     public int LidarrMetadataProfileId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the base URL of the SoulSync instance, e.g. http://soulsync:8008. Empty
+    /// disables it. Song requests go to its <c>/api/v1</c>; album requests (when it takes them,
+    /// see <see cref="AlbumRequestBackend"/>) to its Lidarr-compatible API under <c>/lidarr</c>.
+    /// </summary>
+    public string SoulSyncBaseUrl { get; set; }
+
+    /// <summary>
+    /// Gets or sets the SoulSync API key (<c>sk_…</c>). It must be an admin key: a read key can
+    /// only GET. Sent as <c>X-API-Key</c>.
+    /// </summary>
+    public string SoulSyncApiKey { get; set; }
+
+    /// <summary>
+    /// Gets or sets the SoulSync profile whose wishlist song requests land on (sent as
+    /// <c>X-Profile-Id</c>); 1 is SoulSync's admin profile. That profile's own request limits and
+    /// permissions apply. Album requests use the profile set in SoulSync's Lidarr-compatible API.
+    /// </summary>
+    public int SoulSyncProfileId { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether SoulSync takes album requests at all: its
+    /// Lidarr-compatible API answered the configuration page's check (it is off in SoulSync by
+    /// default). Saved from that check, like the Lidarr dropdowns. Songs don't need it.
+    /// </summary>
+    public bool SoulSyncAlbumsEnabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets which backend takes album requests when both Lidarr and SoulSync are set up.
+    /// With only one set up, that one takes them whatever this says.
+    /// </summary>
+    public RequestBackend AlbumRequestBackend { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether animated-artwork upload and serving are enabled. When

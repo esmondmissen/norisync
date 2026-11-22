@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
@@ -11,35 +12,56 @@ using Microsoft.Extensions.Logging;
 namespace Jellyfin.Plugin.NoriSync.Services;
 
 /// <summary>
-/// Periodically polls Lidarr's queue and per-album statistics to update the tracked
-/// status of every request in <see cref="RequestsStore"/>. Rows whose albums have finished
-/// importing (or have been removed from Lidarr) are deleted — Lidarr is the source of
-/// truth from that point on.
+/// Periodically polls each album backend's queue and per-album statistics (Lidarr, and SoulSync's
+/// Lidarr-compatible API) to update the tracked status of every album request. Rows whose albums
+/// have finished importing (or have been removed) are deleted — the backend is the source of
+/// truth from that point on. Also drives each pending album's search schedule
+/// (<see cref="AlbumSearchScheduler"/>), and moves song requests on (<see cref="TrackRequestsSync"/>).
 /// </summary>
 public class RequestsSyncTask : IScheduledTask
 {
-    private readonly LidarrClient _client;
+    private readonly IReadOnlyList<AlbumBackend>? _backends;
+    private readonly LidarrClient? _client;
+    private readonly AlbumSearchScheduler? _searchScheduler;
+    private readonly TrackRequestsSync? _tracks;
     private readonly ILogger<RequestsSyncTask> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="RequestsSyncTask"/> class.
     /// </summary>
-    /// <param name="client">Lidarr forwarder.</param>
+    /// <param name="backends">The album backends.</param>
+    /// <param name="tracks">The song request sweep.</param>
     /// <param name="logger">Logger.</param>
-    public RequestsSyncTask(LidarrClient client, ILogger<RequestsSyncTask> logger)
+    public RequestsSyncTask(AlbumBackends backends, TrackRequestsSync tracks, ILogger<RequestsSyncTask> logger)
+    {
+        ArgumentNullException.ThrowIfNull(backends);
+        _backends = backends.All;
+        _tracks = tracks;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="RequestsSyncTask"/> class for one Lidarr
+    /// backend, for tests of <see cref="SyncAsync"/>.
+    /// </summary>
+    /// <param name="client">Lidarr forwarder.</param>
+    /// <param name="searchScheduler">Runs the searches for requested albums.</param>
+    /// <param name="logger">Logger.</param>
+    internal RequestsSyncTask(LidarrClient client, AlbumSearchScheduler searchScheduler, ILogger<RequestsSyncTask> logger)
     {
         _client = client;
+        _searchScheduler = searchScheduler;
         _logger = logger;
     }
 
     /// <inheritdoc />
-    public string Name => "NoriSync: Sync Lidarr Request Status";
+    public string Name => "NoriSync: Sync Request Status";
 
     /// <inheritdoc />
     public string Key => "NoriSyncRequestsSync";
 
     /// <inheritdoc />
-    public string Description => "Refreshes the status of tracked Lidarr requests from Lidarr's queue and album stats.";
+    public string Description => "Refreshes the status of album requests (Lidarr, SoulSync) and song requests (SoulSync), and searches for requested albums that haven't been found yet.";
 
     /// <inheritdoc />
     public string Category => "NoriSync";
@@ -49,37 +71,174 @@ public class RequestsSyncTask : IScheduledTask
     {
         ArgumentNullException.ThrowIfNull(progress);
 
-        var store = Plugin.Instance?.RequestsStore;
-        if (store == null)
+        var plugin = Plugin.Instance;
+        if (plugin == null || _backends == null)
         {
             _logger.LogWarning("Plugin not initialized; skipping request sync");
             return;
         }
 
-        if (_client.TryGetBaseUri() == null)
+        var now = DateTimeOffset.UtcNow;
+        var soulSyncAlbums = plugin.SoulSyncRequestsStore.GetDistinctAlbumIds().Count > 0;
+        var songs = plugin.TrackRequestsStore.ListAll().Count > 0;
+        var downloads = (soulSyncAlbums || songs) && _tracks is { IsConfigured: true }
+            ? await ReadSoulSyncDownloadsAsync(cancellationToken).ConfigureAwait(false)
+            : null;
+
+        foreach (var backend in _backends)
         {
-            progress.Report(100);
+            if (backend.Store is { } store)
+            {
+                await SyncAlbumsAsync(backend.Client, backend.Scheduler, store, now, downloads, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        if (songs && downloads != null)
+        {
+            try
+            {
+                await _tracks!.SyncAsync(plugin.TrackRequestsStore, downloads, now, cancellationToken).ConfigureAwait(false);
+            }
+            catch (HttpRequestException ex)
+            {
+                _logger.LogWarning(ex, "SoulSync unreachable during the song request sync");
+            }
+            catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex, "SoulSync song request sync timed out");
+            }
+        }
+
+        progress.Report(100);
+    }
+
+    /// <summary>
+    /// One sweep: every tracked album's status from Lidarr's queue and album stats, and the
+    /// search schedule moved on for albums that are neither downloading nor imported.
+    /// </summary>
+    /// <param name="store">The requests store.</param>
+    /// <param name="now">The current time.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A task completing when the sweep is done.</returns>
+    internal Task SyncAsync(RequestsStore store, DateTimeOffset now, CancellationToken cancellationToken)
+        => SyncAlbumsAsync(_client!, _searchScheduler!, store, now, downloads: null, cancellationToken);
+
+    /// <summary>
+    /// What SoulSync's download tasks say about an album request on it: downloading (with the
+    /// mean progress of its tracks still downloading) or importing; null when none of its tracks
+    /// is in flight. SoulSync's Lidarr-compatible queue is always empty, so this is the only
+    /// sign of progress it gives.
+    /// </summary>
+    /// <param name="album">The album as the compat API's <c>GET album</c> returns it.</param>
+    /// <param name="downloads">SoulSync's download tasks.</param>
+    /// <returns>The status and progress, or null.</returns>
+    internal static (RequestStatus Status, double? Progress)? SoulSyncAlbumActivity(JsonElement album, IReadOnlyList<SoulSyncDownload> downloads)
+    {
+        var title = TrackMatch.Fold(SoulSyncClient.ReadString(album, "title"));
+        var artist = album.TryGetProperty("artist", out var a) ? TrackMatch.Fold(SoulSyncClient.ReadString(a, "artistName")) : string.Empty;
+        if (title.Length == 0)
+        {
+            return null;
+        }
+
+        var tasks = downloads.Where(d => TrackMatch.Fold(d.Album) == title
+            && (artist.Length == 0 || TrackMatch.Fold(d.Artist).Contains(artist, StringComparison.Ordinal) || artist.Contains(TrackMatch.Fold(d.Artist), StringComparison.Ordinal)))
+            .ToList();
+        var downloading = tasks.Where(d => d.Status == "downloading").ToList();
+        if (downloading.Count > 0)
+        {
+            return (RequestStatus.Downloading, downloading.Average(d => d.Progress));
+        }
+
+        return tasks.Any(d => d.Status == "post_processing") ? (RequestStatus.Importing, null) : null;
+    }
+
+    private async Task<IReadOnlyList<SoulSyncDownload>?> ReadSoulSyncDownloadsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _tracks!.ReadDownloadsAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogWarning(ex, "SoulSync unreachable during request sync");
+        }
+        catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "SoulSync downloads read timed out");
+        }
+
+        return null;
+    }
+
+    private async Task SyncAlbumsAsync(
+        LidarrClient client,
+        AlbumSearchScheduler scheduler,
+        RequestsStore store,
+        DateTimeOffset now,
+        IReadOnlyList<SoulSyncDownload>? downloads,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+
+        if (client.TryGetBaseUri() == null)
+        {
             return;
         }
 
         var trackedIds = store.GetDistinctAlbumIds();
         if (trackedIds.Count == 0)
         {
-            progress.Report(100);
             return;
         }
 
-        Dictionary<int, QueueEntry> queueByAlbumId;
-        Dictionary<int, AlbumStats> albumsById;
         try
         {
-            queueByAlbumId = await FetchQueueAsync(cancellationToken).ConfigureAwait(false);
-            albumsById = await FetchAlbumsAsync(trackedIds, cancellationToken).ConfigureAwait(false);
+            var queueByAlbumId = await FetchQueueAsync(client, cancellationToken).ConfigureAwait(false);
+            var albumsById = await FetchAlbumsAsync(client, trackedIds, cancellationToken).ConfigureAwait(false);
+            var searchesLeft = AlbumSearchScheduler.SearchesPerSweep;
+
+            foreach (var albumId in trackedIds)
+            {
+                if (queueByAlbumId.TryGetValue(albumId, out var qe))
+                {
+                    store.UpdateStatusByAlbumId(albumId, qe.Status, qe.Progress, qe.ErrorMessage, now);
+                }
+                else if (!albumsById.TryGetValue(albumId, out var album))
+                {
+                    // Not in queue and the backend no longer knows about the album — admin removed it.
+                    store.DeleteByAlbumId(albumId);
+                    _logger.LogInformation("{Backend} album {AlbumId} no longer exists; dropping tracked requests", client.Backend, albumId);
+                }
+                else if (album.IsFullyImported)
+                {
+                    store.DeleteByAlbumId(albumId);
+                    _logger.LogInformation("{Backend} album {AlbumId} fully imported; dropping tracked requests", client.Backend, albumId);
+                }
+                else
+                {
+                    var activity = client.Backend == RequestBackend.SoulSync && downloads != null
+                        ? SoulSyncAlbumActivity(album.Json, downloads)
+                        : null;
+                    store.UpdateStatusByAlbumId(albumId, activity?.Status ?? RequestStatus.Pending, activity?.Progress, null, now);
+
+                    var searched = await scheduler.AdvanceStoredAsync(
+                        store,
+                        albumId,
+                        album.Json,
+                        now,
+                        maySearch: searchesLeft > 0,
+                        cancellationToken).ConfigureAwait(false);
+                    if (searched)
+                    {
+                        searchesLeft--;
+                    }
+                }
+            }
         }
         catch (HttpRequestException ex)
         {
-            _logger.LogWarning(ex, "Lidarr unreachable during request sync");
-            return;
+            _logger.LogWarning(ex, "{Backend} unreachable during request sync", client.Backend);
         }
         catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -87,39 +246,11 @@ public class RequestsSyncTask : IScheduledTask
         }
         catch (TaskCanceledException ex)
         {
-            _logger.LogWarning(ex, "Lidarr request sync timed out");
-            return;
+            _logger.LogWarning(ex, "{Backend} request sync timed out", client.Backend);
         }
-
-        var now = DateTimeOffset.UtcNow;
-        var done = 0;
-
-        foreach (var albumId in trackedIds)
+        catch (JsonException ex)
         {
-            if (queueByAlbumId.TryGetValue(albumId, out var qe))
-            {
-                store.UpdateStatusByAlbumId(albumId, qe.Status, qe.Progress, qe.ErrorMessage, now);
-            }
-            else if (!albumsById.TryGetValue(albumId, out var album))
-            {
-                // Not in queue and Lidarr no longer knows about the album — admin removed it.
-                store.DeleteByAlbumId(albumId);
-                _logger.LogInformation("Lidarr album {AlbumId} no longer exists; dropping tracked requests", albumId);
-            }
-            else if (album.IsFullyImported)
-            {
-                store.DeleteByAlbumId(albumId);
-                _logger.LogInformation("Lidarr album {AlbumId} fully imported; dropping tracked requests", albumId);
-            }
-            else
-            {
-                // Album exists, no in-flight queue entry. Could be still searching for a release.
-                // Leave the existing row alone; only refresh the timestamp so consumers see liveness.
-                store.UpdateStatusByAlbumId(albumId, RequestStatus.Pending, null, null, now);
-            }
-
-            done++;
-            progress.Report((double)done / trackedIds.Count * 100.0);
+            _logger.LogWarning(ex, "{Backend} answered the request sync with something that isn't JSON", client.Backend);
         }
     }
 
@@ -134,11 +265,11 @@ public class RequestsSyncTask : IScheduledTask
         };
     }
 
-    private async Task<Dictionary<int, QueueEntry>> FetchQueueAsync(CancellationToken cancellationToken)
+    private static async Task<Dictionary<int, QueueEntry>> FetchQueueAsync(LidarrClient client, CancellationToken cancellationToken)
     {
         var byAlbum = new Dictionary<int, QueueEntry>();
 
-        using var upstream = await _client.SendAsync(
+        using var upstream = await client.SendAsync(
             HttpMethod.Get,
             "queue",
             "?pageSize=500&includeUnknownAlbumItems=false",
@@ -202,7 +333,7 @@ public class RequestsSyncTask : IScheduledTask
         return byAlbum;
     }
 
-    private async Task<Dictionary<int, AlbumStats>> FetchAlbumsAsync(IReadOnlyList<int> albumIds, CancellationToken cancellationToken)
+    private static async Task<Dictionary<int, AlbumStats>> FetchAlbumsAsync(LidarrClient client, IReadOnlyList<int> albumIds, CancellationToken cancellationToken)
     {
         var byId = new Dictionary<int, AlbumStats>();
         if (albumIds.Count == 0)
@@ -228,7 +359,7 @@ public class RequestsSyncTask : IScheduledTask
                 query += "albumIds=" + albumIds[j];
             }
 
-            using var upstream = await _client.SendAsync(
+            using var upstream = await client.SendAsync(
                 HttpMethod.Get,
                 "album",
                 query,
@@ -261,7 +392,7 @@ public class RequestsSyncTask : IScheduledTask
                 }
 
                 var (fileCount, totalCount) = ExtractTrackCounts(album);
-                byId[id] = new AlbumStats(fileCount, totalCount);
+                byId[id] = new AlbumStats(fileCount, totalCount, album.Clone());
             }
         }
 
@@ -376,7 +507,7 @@ public class RequestsSyncTask : IScheduledTask
 
     private readonly record struct QueueEntry(RequestStatus Status, double? Progress, string? ErrorMessage);
 
-    private readonly record struct AlbumStats(int FileCount, int TotalCount)
+    private readonly record struct AlbumStats(int FileCount, int TotalCount, JsonElement Json)
     {
         public bool IsFullyImported => TotalCount > 0 && FileCount >= TotalCount;
     }

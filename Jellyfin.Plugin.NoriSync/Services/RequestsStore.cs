@@ -15,31 +15,67 @@ namespace Jellyfin.Plugin.NoriSync.Services;
 public class RequestsStore : IDisposable
 {
     private const string BaseSelect = @"
-        SELECT JellyfinUserId, LidarrAlbumId, AlbumMbid, AlbumTitle, ArtistName,
-               SubmittedAt, Status, StatusUpdatedAt, DownloadProgress, LastError
-        FROM Requests";
+        SELECT r.JellyfinUserId, r.LidarrAlbumId, r.AlbumMbid, r.AlbumTitle, r.ArtistName,
+               r.SubmittedAt, r.Status, r.StatusUpdatedAt, r.DownloadProgress, r.LastError,
+               s.State, s.Attempts, s.LastSearchedAt, s.NextSearchAt, s.LastMessage
+        FROM Requests r
+        LEFT JOIN AlbumSearches s ON s.LidarrAlbumId = r.LidarrAlbumId";
+
+    private const string SearchSelect = @"
+        SELECT LidarrAlbumId, State, Attempts, WindowStart, LastSearchedAt, NextSearchAt,
+               CommandId, LastMessage
+        FROM AlbumSearches";
 
     private readonly SqliteConnection _connection;
     private readonly ILogger _logger;
     private readonly object _writeLock = new();
+    private readonly RequestBackend _backend;
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="RequestsStore"/> class.
+    /// Initializes a new instance of the <see cref="RequestsStore"/> class: Lidarr's requests,
+    /// in <c>requests.db</c>.
     /// </summary>
     /// <param name="dataPath">The directory path where the database file will be stored.</param>
     /// <param name="logger">Logger instance.</param>
     public RequestsStore(string dataPath, ILogger logger)
+        : this(dataPath, logger, RequestBackend.Lidarr)
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="RequestsStore"/> class for one backend. Each
+    /// backend has its own file: album ids are the backend's own, so one table would mix up two
+    /// albums that share an id.
+    /// </summary>
+    /// <param name="dataPath">The directory path where the database file will be stored.</param>
+    /// <param name="logger">Logger instance.</param>
+    /// <param name="backend">Whose requests the file holds; stamped on every row read.</param>
+    public RequestsStore(string dataPath, ILogger logger, RequestBackend backend)
     {
         Directory.CreateDirectory(dataPath);
-        var dbPath = Path.Combine(dataPath, "requests.db");
+        var dbPath = Path.Combine(dataPath, FileName(backend));
         _logger = logger;
+        _backend = backend;
 
         _connection = new SqliteConnection($"Data Source={dbPath}");
         _connection.Open();
 
         InitializeDatabase();
-        _logger.LogInformation("Lidarr requests database opened at {Path}", dbPath);
+        _logger.LogInformation("{Backend} requests database opened at {Path}", backend, dbPath);
     }
+
+    /// <summary>
+    /// Gets the backend whose requests this store holds.
+    /// </summary>
+    public RequestBackend Backend => _backend;
+
+    /// <summary>
+    /// The database file name for a backend's requests.
+    /// </summary>
+    /// <param name="backend">The backend.</param>
+    /// <returns>The file name.</returns>
+    internal static string FileName(RequestBackend backend)
+        => backend == RequestBackend.SoulSync ? "soulsync-requests.db" : "requests.db";
 
     /// <summary>
     /// Inserts or updates a tracked request.
@@ -91,7 +127,7 @@ public class RequestsStore : IDisposable
     public IReadOnlyList<RequestRecord> ListByUser(Guid userId)
     {
         using var cmd = _connection.CreateCommand();
-        cmd.CommandText = BaseSelect + " WHERE JellyfinUserId = $userId ORDER BY SubmittedAt DESC";
+        cmd.CommandText = BaseSelect + " WHERE r.JellyfinUserId = $userId ORDER BY r.SubmittedAt DESC";
         cmd.Parameters.AddWithValue("$userId", userId.ToString());
         return ExecuteQuery(cmd);
     }
@@ -103,7 +139,7 @@ public class RequestsStore : IDisposable
     public IReadOnlyList<RequestRecord> ListAll()
     {
         using var cmd = _connection.CreateCommand();
-        cmd.CommandText = BaseSelect + " ORDER BY SubmittedAt DESC";
+        cmd.CommandText = BaseSelect + " ORDER BY r.SubmittedAt DESC";
         return ExecuteQuery(cmd);
     }
 
@@ -194,7 +230,9 @@ public class RequestsStore : IDisposable
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = "DELETE FROM Requests WHERE LidarrAlbumId = $albumId";
             cmd.Parameters.AddWithValue("$albumId", albumId);
-            return cmd.ExecuteNonQuery();
+            var removed = cmd.ExecuteNonQuery();
+            DeleteSearchLocked(albumId);
+            return removed;
         }
     }
 
@@ -212,7 +250,64 @@ public class RequestsStore : IDisposable
             cmd.CommandText = "DELETE FROM Requests WHERE JellyfinUserId = $userId AND LidarrAlbumId = $albumId";
             cmd.Parameters.AddWithValue("$userId", userId.ToString());
             cmd.Parameters.AddWithValue("$albumId", albumId);
-            return cmd.ExecuteNonQuery() > 0;
+            var removed = cmd.ExecuteNonQuery() > 0;
+
+            // The schedule is the album's, shared by its requesters: it goes with the last one.
+            using var remaining = _connection.CreateCommand();
+            remaining.CommandText = "SELECT COUNT(*) FROM Requests WHERE LidarrAlbumId = $albumId";
+            remaining.Parameters.AddWithValue("$albumId", albumId);
+            if (Convert.ToInt64(remaining.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture) == 0)
+            {
+                DeleteSearchLocked(albumId);
+            }
+
+            return removed;
+        }
+    }
+
+    /// <summary>
+    /// Returns one album's search schedule, or null when it has none.
+    /// </summary>
+    /// <param name="albumId">The Lidarr album id.</param>
+    /// <returns>The schedule, or null.</returns>
+    public AlbumSearchRecord? GetSearch(int albumId)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = SearchSelect + " WHERE LidarrAlbumId = $albumId";
+        cmd.Parameters.AddWithValue("$albumId", albumId);
+        using var reader = cmd.ExecuteReader();
+        return reader.Read() ? ReadSearch(reader) : null;
+    }
+
+    /// <summary>
+    /// Inserts or replaces an album's search schedule. Ignored for an album with no request row.
+    /// </summary>
+    /// <param name="record">The schedule.</param>
+    public void UpsertSearch(AlbumSearchRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+
+        lock (_writeLock)
+        {
+            using var cmd = _connection.CreateCommand();
+            // Only while someone still requests the album: a sweep finishing after the last
+            // request was cancelled would otherwise leave an orphan schedule.
+            cmd.CommandText = @"
+                INSERT OR REPLACE INTO AlbumSearches (
+                    LidarrAlbumId, State, Attempts, WindowStart, LastSearchedAt, NextSearchAt,
+                    CommandId, LastMessage)
+                SELECT $albumId, $state, $attempts, $windowStart, $lastSearchedAt, $nextSearchAt,
+                    $commandId, $message
+                WHERE EXISTS (SELECT 1 FROM Requests WHERE LidarrAlbumId = $albumId);";
+            cmd.Parameters.AddWithValue("$albumId", record.LidarrAlbumId);
+            cmd.Parameters.AddWithValue("$state", record.State.ToString());
+            cmd.Parameters.AddWithValue("$attempts", record.Attempts);
+            cmd.Parameters.AddWithValue("$windowStart", record.WindowStart.ToUnixTimeMilliseconds());
+            cmd.Parameters.AddWithValue("$lastSearchedAt", (object?)record.LastSearchedAt?.ToUnixTimeMilliseconds() ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$nextSearchAt", (object?)record.NextSearchAt?.ToUnixTimeMilliseconds() ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$commandId", (object?)record.CommandId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$message", (object?)record.LastMessage ?? DBNull.Value);
+            cmd.ExecuteNonQuery();
         }
     }
 
@@ -256,11 +351,22 @@ public class RequestsStore : IDisposable
             );
 
             CREATE INDEX IF NOT EXISTS IX_Requests_AlbumId ON Requests(LidarrAlbumId);
-            CREATE INDEX IF NOT EXISTS IX_Requests_Status  ON Requests(Status);";
+            CREATE INDEX IF NOT EXISTS IX_Requests_Status  ON Requests(Status);
+
+            CREATE TABLE IF NOT EXISTS AlbumSearches (
+                LidarrAlbumId   INTEGER  NOT NULL PRIMARY KEY,
+                State           TEXT     NOT NULL,
+                Attempts        INTEGER  NOT NULL,
+                WindowStart     INTEGER  NOT NULL,
+                LastSearchedAt  INTEGER,
+                NextSearchAt    INTEGER,
+                CommandId       INTEGER,
+                LastMessage     TEXT
+            );";
         cmd.ExecuteNonQuery();
     }
 
-    private static List<RequestRecord> ExecuteQuery(SqliteCommand cmd)
+    private List<RequestRecord> ExecuteQuery(SqliteCommand cmd)
     {
         var rows = new List<RequestRecord>();
         using var reader = cmd.ExecuteReader();
@@ -268,6 +374,7 @@ public class RequestsStore : IDisposable
         {
             rows.Add(new RequestRecord
             {
+                Backend = _backend,
                 JellyfinUserId = Guid.Parse(reader.GetString(0)),
                 LidarrAlbumId = reader.GetInt32(1),
                 AlbumMbid = reader.IsDBNull(2) ? null : reader.GetString(2),
@@ -277,10 +384,41 @@ public class RequestsStore : IDisposable
                 Status = Enum.TryParse<RequestStatus>(reader.GetString(6), out var s) ? s : RequestStatus.Pending,
                 StatusUpdatedAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(7)),
                 DownloadProgress = reader.IsDBNull(8) ? null : reader.GetDouble(8),
-                LastError = reader.IsDBNull(9) ? null : reader.GetString(9)
+                LastError = reader.IsDBNull(9) ? null : reader.GetString(9),
+                SearchState = reader.IsDBNull(10) ? null : ParseSearchState(reader.GetString(10)),
+                SearchAttempts = reader.IsDBNull(11) ? null : reader.GetInt32(11),
+                LastSearchedAt = ReadTime(reader, 12),
+                NextSearchAt = ReadTime(reader, 13),
+                LastSearchMessage = reader.IsDBNull(14) ? null : reader.GetString(14)
             });
         }
 
         return rows;
     }
+
+    private void DeleteSearchLocked(int albumId)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM AlbumSearches WHERE LidarrAlbumId = $albumId";
+        cmd.Parameters.AddWithValue("$albumId", albumId);
+        cmd.ExecuteNonQuery();
+    }
+
+    private static AlbumSearchRecord ReadSearch(SqliteDataReader reader) => new()
+    {
+        LidarrAlbumId = reader.GetInt32(0),
+        State = ParseSearchState(reader.GetString(1)),
+        Attempts = reader.GetInt32(2),
+        WindowStart = DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(3)),
+        LastSearchedAt = ReadTime(reader, 4),
+        NextSearchAt = ReadTime(reader, 5),
+        CommandId = reader.IsDBNull(6) ? null : reader.GetInt32(6),
+        LastMessage = reader.IsDBNull(7) ? null : reader.GetString(7)
+    };
+
+    private static AlbumSearchState ParseSearchState(string raw)
+        => Enum.TryParse<AlbumSearchState>(raw, out var state) ? state : AlbumSearchState.AwaitingMetadata;
+
+    private static DateTimeOffset? ReadTime(SqliteDataReader reader, int ordinal)
+        => reader.IsDBNull(ordinal) ? null : DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(ordinal));
 }

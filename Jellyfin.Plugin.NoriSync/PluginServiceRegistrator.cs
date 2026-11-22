@@ -22,6 +22,13 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<ArtworkProbe>();
         serviceCollection.AddSingleton<ArtworkTranscoder>();
         serviceCollection.AddSingleton<LidarrClient>();
+        serviceCollection.AddSingleton<AlbumSearchScheduler>();
+        serviceCollection.AddSingleton<LidarrArtistMonitoring>();
+        serviceCollection.AddSingleton<AlbumBackends>();
+        serviceCollection.AddSingleton<SoulSyncClient>();
+        serviceCollection.AddSingleton<ITrackLibrary, JellyfinTrackLibrary>();
+        serviceCollection.AddSingleton<TrackRequestService>();
+        serviceCollection.AddSingleton<TrackRequestsSync>();
         serviceCollection.AddSingleton<RemoteImageFetcher>();
         serviceCollection.AddSingleton<MusicBrainzClient>();
         serviceCollection.AddSingleton<AppleMusicArtworkClient>();

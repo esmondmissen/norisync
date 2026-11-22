@@ -12,7 +12,8 @@ using Microsoft.Extensions.Logging;
 namespace Jellyfin.Plugin.NoriSync.Services;
 
 /// <summary>
-/// Thin forwarder to a Lidarr instance. Auth is Lidarr's API key, attached as
+/// Thin forwarder to a Lidarr instance, or to SoulSync's Lidarr-compatible API
+/// (<see cref="ForSoulSyncCompat"/>), which answers the same routes. Auth is Lidarr's API key, attached as
 /// <c>X-Api-Key</c> on every upstream call. Base URL and key are read fresh from plugin
 /// configuration on each request so admin edits take effect without a restart.
 /// </summary>
@@ -24,12 +25,26 @@ public sealed class LidarrClient : IDisposable
     /// </summary>
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// How long an ordinary call waits for Lidarr. Its MusicBrainz-backed lookups can be slow
+    /// on a cold cache.
+    /// </summary>
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// How long an interactive search (<c>GET release</c>) waits: Lidarr queries every
+    /// indexer live before it answers, and one slow indexer holds the whole reply.
+    /// </summary>
+    public static readonly TimeSpan InteractiveSearchTimeout = TimeSpan.FromMinutes(3);
+
     private readonly HttpClient _http;
     private readonly ILogger<LidarrClient> _logger;
+    private readonly Func<LidarrConnection?> _connection;
     private bool _disposed;
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="LidarrClient"/> class.
+    /// Initializes a new instance of the <see cref="LidarrClient"/> class for the configured
+    /// Lidarr.
     /// </summary>
     /// <param name="logger">Logger instance.</param>
     public LidarrClient(ILogger<LidarrClient> logger)
@@ -38,47 +53,71 @@ public sealed class LidarrClient : IDisposable
     }
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="LidarrClient"/> class with a custom
-    /// message handler, so tests can stand in for Lidarr.
+    /// Initializes a new instance of the <see cref="LidarrClient"/> class for the configured
+    /// Lidarr, with a custom message handler, so tests can stand in for Lidarr.
     /// </summary>
     /// <param name="logger">Logger instance.</param>
     /// <param name="handler">Handler that sends the HTTP requests. Disposed with the client.</param>
     internal LidarrClient(ILogger<LidarrClient> logger, HttpMessageHandler handler)
+        : this(logger, handler, RequestBackend.Lidarr, () => ConfiguredLidarr(logger))
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="LidarrClient"/> class bound to a fixed URL
+    /// and key instead of the plugin configuration, so tests can drive the request flow with
+    /// no plugin instance.
+    /// </summary>
+    /// <param name="logger">Logger instance.</param>
+    /// <param name="handler">Handler that sends the HTTP requests. Disposed with the client.</param>
+    /// <param name="baseUri">The Lidarr base URI, ending in a slash.</param>
+    /// <param name="apiKey">The API key.</param>
+    /// <param name="backend">What answers at that URI: Lidarr, or SoulSync's Lidarr-compatible API.</param>
+    internal LidarrClient(ILogger<LidarrClient> logger, HttpMessageHandler handler, Uri baseUri, string apiKey, RequestBackend backend = RequestBackend.Lidarr)
+        : this(logger, handler, backend, () => new LidarrConnection(baseUri, apiKey))
+    {
+    }
+
+    private LidarrClient(ILogger<LidarrClient> logger, HttpMessageHandler handler, RequestBackend backend, Func<LidarrConnection?>? connection)
     {
         _logger = logger;
+        Backend = backend;
+        _connection = connection ?? (() => null);
         _http = new HttpClient(handler, disposeHandler: true)
         {
-            // Lidarr's MusicBrainz-backed lookups can be slow on cold cache.
-            Timeout = TimeSpan.FromSeconds(60)
+            // Each call sets its own limit (DefaultTimeout unless it asks for longer).
+            Timeout = System.Threading.Timeout.InfiniteTimeSpan
         };
     }
 
     /// <summary>
-    /// Resolves the configured Lidarr base URI, or null when URL/key is missing or invalid.
+    /// Gets what answers this client: Lidarr, or SoulSync's Lidarr-compatible API.
     /// </summary>
-    /// <returns>The base URI ending in a slash, or null when the proxy is disabled.</returns>
-    public Uri? TryGetBaseUri()
-    {
-        var config = Plugin.Instance?.Configuration;
-        if (config == null)
-        {
-            return null;
-        }
+    public RequestBackend Backend { get; }
 
-        if (string.IsNullOrWhiteSpace(config.LidarrBaseUrl)
-            || string.IsNullOrWhiteSpace(config.LidarrApiKey))
-        {
-            return null;
-        }
+    /// <summary>
+    /// A client for SoulSync's Lidarr-compatible API (<c>{SoulSyncBaseUrl}/lidarr/api/v1</c>),
+    /// with the SoulSync key, read fresh from the configuration on each call like Lidarr's.
+    /// </summary>
+    /// <param name="logger">Logger instance.</param>
+    /// <param name="handler">Handler that sends the HTTP requests; a plain one when null.</param>
+    /// <returns>The client.</returns>
+    public static LidarrClient ForSoulSyncCompat(ILogger<LidarrClient> logger, HttpMessageHandler? handler = null)
+        => new(logger, handler ?? new HttpClientHandler(), RequestBackend.SoulSync, ConfiguredSoulSyncCompat);
 
-        var uri = TryParseBaseUri(config.LidarrBaseUrl);
-        if (uri == null)
-        {
-            _logger.LogWarning("Lidarr base URL '{Url}' is not a valid http(s) URL", config.LidarrBaseUrl);
-        }
+    /// <summary>
+    /// Where SoulSync's Lidarr-compatible API sits under a SoulSync base URL.
+    /// </summary>
+    /// <param name="soulSyncBaseUrl">The SoulSync URL as typed or stored.</param>
+    /// <returns>The compat base URI ending in a slash, or null when the URL isn't http(s).</returns>
+    internal static Uri? SoulSyncCompatBaseUri(string? soulSyncBaseUrl)
+        => TryParseBaseUri(soulSyncBaseUrl) is { } root ? new Uri(root, "lidarr/") : null;
 
-        return uri;
-    }
+    /// <summary>
+    /// Resolves the base URI, or null when URL/key is missing or invalid.
+    /// </summary>
+    /// <returns>The base URI ending in a slash, or null when this backend is off.</returns>
+    public Uri? TryGetBaseUri() => _connection()?.BaseUri;
 
     /// <summary>
     /// Sends a request to <c>{base}/api/v1/{relativePath}{queryString}</c> with the API key
@@ -90,6 +129,7 @@ public sealed class LidarrClient : IDisposable
     /// <param name="body">Optional request body. The caller retains ownership.</param>
     /// <param name="completionOption">When the returned task completes. Use <c>ResponseHeadersRead</c> for streamed payloads such as cover art.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
+    /// <param name="timeout">How long to wait for the response (headers, for <c>ResponseHeadersRead</c>); <see cref="DefaultTimeout"/> when null.</param>
     /// <returns>The upstream response. Caller must dispose.</returns>
     public Task<HttpResponseMessage> SendAsync(
         HttpMethod method,
@@ -97,15 +137,13 @@ public sealed class LidarrClient : IDisposable
         string? queryString,
         HttpContent? body,
         HttpCompletionOption completionOption,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? timeout = null)
     {
-        var config = Plugin.Instance?.Configuration
-            ?? throw new InvalidOperationException("Plugin configuration is not available");
+        var connection = _connection()
+            ?? throw new InvalidOperationException(Backend + " is not configured");
 
-        var baseUri = TryGetBaseUri()
-            ?? throw new InvalidOperationException("Lidarr is not configured");
-
-        return SendAsync(baseUri, config.LidarrApiKey, method, relativePath, queryString, body, completionOption, cancellationToken);
+        return SendAsync(connection.BaseUri, connection.ApiKey, method, relativePath, queryString, body, completionOption, cancellationToken, timeout);
     }
 
     /// <summary>
@@ -224,7 +262,8 @@ public sealed class LidarrClient : IDisposable
         string? queryString,
         HttpContent? body,
         HttpCompletionOption completionOption,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? timeout = null)
     {
         ArgumentNullException.ThrowIfNull(method);
         ArgumentException.ThrowIfNullOrWhiteSpace(relativePath);
@@ -240,7 +279,11 @@ public sealed class LidarrClient : IDisposable
             request.Content = body;
         }
 
-        return await _http.SendAsync(request, completionOption, cancellationToken).ConfigureAwait(false);
+        // Bounds the response only: a ResponseHeadersRead body is read on the caller's token,
+        // as HttpClient.Timeout never covered it either.
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        limit.CancelAfter(timeout ?? DefaultTimeout);
+        return await _http.SendAsync(request, completionOption, limit.Token).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -381,6 +424,39 @@ public sealed class LidarrClient : IDisposable
 
     private static LidarrProbeResponse Failure(LidarrProbeStatus status, string message)
         => new() { Status = status, Message = message };
+
+    private static LidarrConnection? ConfiguredLidarr(ILogger logger)
+    {
+        var config = Plugin.Instance?.Configuration;
+        if (config == null
+            || string.IsNullOrWhiteSpace(config.LidarrBaseUrl)
+            || string.IsNullOrWhiteSpace(config.LidarrApiKey))
+        {
+            return null;
+        }
+
+        var uri = TryParseBaseUri(config.LidarrBaseUrl);
+        if (uri == null)
+        {
+            logger.LogWarning("Lidarr base URL '{Url}' is not a valid http(s) URL", config.LidarrBaseUrl);
+            return null;
+        }
+
+        return new LidarrConnection(uri, config.LidarrApiKey);
+    }
+
+    private static LidarrConnection? ConfiguredSoulSyncCompat()
+    {
+        var config = Plugin.Instance?.Configuration;
+        if (config == null || !config.SoulSyncAlbumsEnabled || string.IsNullOrWhiteSpace(config.SoulSyncApiKey))
+        {
+            return null;
+        }
+
+        return SoulSyncCompatBaseUri(config.SoulSyncBaseUrl) is { } uri
+            ? new LidarrConnection(uri, config.SoulSyncApiKey.Trim())
+            : null;
+    }
 
     private readonly record struct ProbeReply(HttpStatusCode Status, JsonElement? Body);
 }

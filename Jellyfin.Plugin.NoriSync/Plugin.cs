@@ -48,6 +48,8 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages, IDisposable
 
         var requestsLogger = loggerFactory.CreateLogger<RequestsStore>();
         RequestsStore = new RequestsStore(dataPath, requestsLogger);
+        SoulSyncRequestsStore = new RequestsStore(dataPath, requestsLogger, Models.RequestBackend.SoulSync);
+        TrackRequestsStore = new TrackRequestsStore(dataPath, loggerFactory.CreateLogger<TrackRequestsStore>());
 
         var audioInfoLogger = loggerFactory.CreateLogger<AudioInfoStore>();
         AudioInfoStore = new AudioInfoStore(dataPath, audioInfoLogger);
@@ -102,6 +104,16 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages, IDisposable
     /// Gets the Lidarr requests store.
     /// </summary>
     public RequestsStore RequestsStore { get; }
+
+    /// <summary>
+    /// Gets the store of album requests sent to SoulSync (its Lidarr-compatible API).
+    /// </summary>
+    public RequestsStore SoulSyncRequestsStore { get; }
+
+    /// <summary>
+    /// Gets the store of song requests (SoulSync's wishlist).
+    /// </summary>
+    public TrackRequestsStore TrackRequestsStore { get; }
 
     /// <summary>
     /// Gets the cache of computed exact audio-decode metadata.
@@ -172,6 +184,8 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages, IDisposable
             InstanceStore.Dispose();
             DjLibraryStore.Dispose();
             RequestsStore.Dispose();
+            SoulSyncRequestsStore.Dispose();
+            TrackRequestsStore.Dispose();
             AudioInfoStore.Dispose();
             AnimatedArtworkStore.Dispose();
             CoverDesignStore.Dispose();

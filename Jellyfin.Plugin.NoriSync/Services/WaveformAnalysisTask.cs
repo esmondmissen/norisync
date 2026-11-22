@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -16,14 +17,17 @@ namespace Jellyfin.Plugin.NoriSync.Services;
 
 /// <summary>
 /// Scheduled task that walks every audio item in the library and runs the local waveform
-/// analyzer, persisting a compact visualization blob per track. Tracks whose waveform is already
-/// fresh — based on the stored analyzer version and the source file's mtime — are skipped.
+/// analyzer and the beat mix descriptor over one decode, persisting both per track. Tracks
+/// whose analysis is already fresh — both stored analyzer versions and the source file's
+/// mtime match — are skipped.
 /// </summary>
 public class WaveformAnalysisTask : IScheduledTask
 {
     private readonly ILibraryManager _libraryManager;
     private readonly FfmpegAudioDecoder _decoder;
     private readonly ILogger<WaveformAnalysisTask> _logger;
+    private long _waveformTicks;
+    private long _mixProfileTicks;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="WaveformAnalysisTask"/> class.
@@ -89,6 +93,8 @@ public class WaveformAnalysisTask : IScheduledTask
         var failed = 0;
         var seen = 0;
         string? terminalError = null;
+        Interlocked.Exchange(ref _waveformTicks, 0);
+        Interlocked.Exchange(ref _mixProfileTicks, 0);
 
         var parallelOptions = new ParallelOptions
         {
@@ -117,7 +123,8 @@ public class WaveformAnalysisTask : IScheduledTask
                 }
 
                 var mtime = GetMtime(audio.Path);
-                if (store.HasFreshWaveform(audio.Id, WaveformAnalyzer.Version, mtime))
+                var size = GetSize(audio.Path);
+                if (store.HasFreshWaveform(audio.Id, WaveformAnalyzer.Version, MixProfileAnalyzer.StoredVersion, mtime, size))
                 {
                     Interlocked.Increment(ref skipped);
                     tracker.IncrementSkipped();
@@ -126,7 +133,7 @@ public class WaveformAnalysisTask : IScheduledTask
 
                 try
                 {
-                    var ok = await ProcessTrackAsync(audio, mtime, ct).ConfigureAwait(false);
+                    var ok = await ProcessTrackAsync(audio, mtime, size, ct).ConfigureAwait(false);
                     if (ok)
                     {
                         store.IncrementLifetimeProcessed(1);
@@ -153,12 +160,14 @@ public class WaveformAnalysisTask : IScheduledTask
 
             progress.Report(100);
             _logger.LogInformation(
-                "Waveform analysis run complete: processed={Processed} skipped={Skipped} failed={Failed} total={Total} concurrency={Concurrency}",
+                "Waveform analysis run complete: processed={Processed} skipped={Skipped} failed={Failed} total={Total} concurrency={Concurrency} waveformCpu={WaveformSeconds:F1}s mixProfileCpu={MixProfileSeconds:F1}s",
                 processed,
                 skipped,
                 failed,
                 total,
-                concurrency);
+                concurrency,
+                Stopwatch.GetElapsedTime(0, Interlocked.Read(ref _waveformTicks)).TotalSeconds,
+                Stopwatch.GetElapsedTime(0, Interlocked.Read(ref _mixProfileTicks)).TotalSeconds);
         }
         catch (OperationCanceledException)
         {
@@ -187,7 +196,7 @@ public class WaveformAnalysisTask : IScheduledTask
         };
     }
 
-    private async Task<bool> ProcessTrackAsync(Audio audio, long mtime, CancellationToken cancellationToken)
+    private async Task<bool> ProcessTrackAsync(Audio audio, long mtime, long size, CancellationToken cancellationToken)
     {
         var store = Plugin.Instance?.FeatureStore;
         if (store == null)
@@ -195,23 +204,48 @@ public class WaveformAnalysisTask : IScheduledTask
             return false;
         }
 
-        var samples = await _decoder.DecodeAsync(audio.Path, WaveformAnalyzer.SampleRate, cancellationToken)
-            .ConfigureAwait(false);
+        // Both analysers take the decode as it arrives, so a long mix is never held whole. One
+        // that throws stops being fed; the other still finishes.
+        var waveformAnalysis = new WaveformAnalyzer.Accumulator(WaveformAnalyzer.SampleRate);
+        var mixAnalysis = new MixProfileAnalyzer.Accumulator(WaveformAnalyzer.SampleRate);
+        var waveformFailed = false;
+        var mixFailed = false;
+        var decoded = await _decoder.DecodeAsync(
+            audio.Path,
+            WaveformAnalyzer.SampleRate,
+            (buffer, count) =>
+            {
+                if (!waveformFailed)
+                {
+                    waveformFailed = !Measure(ref _waveformTicks, () => waveformAnalysis.Append(buffer.AsSpan(0, count)), audio, "Waveform");
+                }
 
-        if (samples.Length == 0)
+                if (!mixFailed)
+                {
+                    mixFailed = !Measure(ref _mixProfileTicks, () => mixAnalysis.Append(buffer.AsSpan(0, count)), audio, "Mix profile");
+                }
+            },
+            cancellationToken).ConfigureAwait(false);
+
+        if (decoded == 0)
         {
             _logger.LogDebug("Decoded zero samples for {Name} ({Id})", audio.Name, audio.Id);
             return false;
         }
 
         byte[]? waveform = null;
-        try
+        if (!waveformFailed)
         {
-            waveform = WaveformAnalyzer.Analyze(samples, WaveformAnalyzer.SampleRate);
+            Measure(ref _waveformTicks, () => waveform = waveformAnalysis.Finish(), audio, "Waveform");
         }
-        catch (Exception ex)
+
+        // Same samples, same timeline. A null descriptor (too short / silent) is still a
+        // finished analysis; only a throw leaves the version unset, to retry next run.
+        byte[]? mixProfile = null;
+        string? mixProfileVersion = null;
+        if (!mixFailed && Measure(ref _mixProfileTicks, () => mixProfile = mixAnalysis.Finish(), audio, "Mix profile"))
         {
-            _logger.LogDebug(ex, "Waveform analysis failed for {Name}", audio.Name);
+            mixProfileVersion = MixProfileAnalyzer.StoredVersion;
         }
 
         var feature = new TrackFeature
@@ -219,11 +253,35 @@ public class WaveformAnalysisTask : IScheduledTask
             ItemId = audio.Id,
             Waveform = waveform,
             WaveformVersion = waveform != null ? WaveformAnalyzer.Version : null,
+            MixProfile = mixProfile,
+            MixProfileVersion = mixProfileVersion,
             SourceMtime = mtime,
-            ProcessedAt = DateTimeOffset.UtcNow
+            SourceSize = size >= 0 ? size : null
         };
         store.Upsert(feature, ResolveLibraryIds(audio));
         return true;
+    }
+
+    /// <summary>
+    /// Runs one analysis step, adding its CPU time to <paramref name="ticks"/>; false if it threw.
+    /// </summary>
+    private bool Measure(ref long ticks, Action step, Audio audio, string analysis)
+    {
+        var started = Stopwatch.GetTimestamp();
+        try
+        {
+            step();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "{Analysis} analysis failed for {Name}", analysis, audio.Name);
+            return false;
+        }
+        finally
+        {
+            Interlocked.Add(ref ticks, Stopwatch.GetTimestamp() - started);
+        }
     }
 
     private static long GetMtime(string path)
@@ -235,6 +293,23 @@ public class WaveformAnalysisTask : IScheduledTask
         catch (IOException)
         {
             return 0;
+        }
+    }
+
+    /// <summary>The file's size in bytes, or -1 when it can't be read.</summary>
+    private static long GetSize(string path)
+    {
+        try
+        {
+            return new FileInfo(path).Length;
+        }
+        catch (IOException)
+        {
+            return -1;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return -1;
         }
     }
 

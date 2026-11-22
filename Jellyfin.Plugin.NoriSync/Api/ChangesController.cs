@@ -328,14 +328,19 @@ public class ChangesController : ControllerBase
             return StatusCode(StatusCodes.Status503ServiceUnavailable);
         }
 
-        var lidarrClient = HttpContext.RequestServices.GetRequiredService<Services.LidarrClient>();
-        var lidarrConfigured = lidarrClient.TryGetBaseUri() != null;
-        if (lidarrConfigured && (plugin.Configuration?.LidarrRequireAdmin ?? true))
+        // Album requests on either backend (named for Lidarr, the first), and song requests on
+        // SoulSync, each folded with whether this caller may request at all.
+        var albumBackend = HttpContext.RequestServices.GetRequiredService<Services.AlbumBackends>().Active;
+        var songsConfigured = HttpContext.RequestServices.GetRequiredService<Services.SoulSyncClient>().IsConfigured;
+        var mayRequest = true;
+        if ((albumBackend != null || songsConfigured) && (plugin.Configuration?.LidarrRequireAdmin ?? true))
         {
             var user = GetJellyfinUser();
-            lidarrConfigured = user?.Permissions
+            mayRequest = user?.Permissions
                 .FirstOrDefault(p => p.Kind == PermissionKind.IsAdministrator)?.Value ?? false;
         }
+
+        var lidarrConfigured = albumBackend != null && mayRequest;
 
         // Detect whether the third-party AudioMuse AI plugin is installed so clients can
         // surface its sonic-analysis features. Match on the plugin's manifest GUID, which is
@@ -349,6 +354,8 @@ public class ChangesController : ControllerBase
             plugin.Name,
             Version = plugin.Version.ToString(),
             LidarrConfigured = lidarrConfigured,
+            AlbumRequestsBackend = lidarrConfigured ? albumBackend!.Kind : (Models.RequestBackend?)null,
+            TrackRequestsConfigured = songsConfigured && mayRequest,
             AudioMuseInstalled = audioMuse != null,
             AudioMuseEnabled = audioMuse?.IsEnabledAndSupported ?? false,
             AudioMuseVersion = audioMuse?.Version.ToString(),

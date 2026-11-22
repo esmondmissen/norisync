@@ -30,18 +30,25 @@ public class FfmpegAudioDecoder
     }
 
     /// <summary>
-    /// Decodes the given media file to mono 32-bit float PCM at the requested sample rate.
+    /// Decodes the given media file to mono 32-bit float PCM at the requested sample rate,
+    /// handing the samples to <paramref name="onSamples"/> in pieces, in order, as ffmpeg
+    /// produces them (on the calling task, so a slow consumer slows the decode). Never the
+    /// whole track at once: held whole, a multi-hour mix ran the server out of memory.
     /// </summary>
     /// <param name="sourcePath">The absolute path of the audio file to decode.</param>
     /// <param name="targetSampleRate">Target sample rate in Hz.</param>
+    /// <param name="onSamples">Receives each piece: the buffer and how many samples it holds
+    /// (the buffer is reused for the next piece).</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>The decoded PCM samples as a float array.</returns>
-    public async Task<float[]> DecodeAsync(string sourcePath, int targetSampleRate, CancellationToken cancellationToken)
+    /// <returns>The number of samples decoded.</returns>
+    public async Task<long> DecodeAsync(string sourcePath, int targetSampleRate, Action<float[], int> onSamples, CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(sourcePath))
         {
             throw new ArgumentException("sourcePath is required", nameof(sourcePath));
         }
+
+        ArgumentNullException.ThrowIfNull(onSamples);
 
         var ffmpeg = _mediaEncoder.EncoderPath;
         if (string.IsNullOrEmpty(ffmpeg))
@@ -69,9 +76,29 @@ public class FfmpegAudioDecoder
             throw new InvalidOperationException("Failed to launch ffmpeg");
         }
 
-        using var memory = new MemoryStream();
         var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.StandardOutput.BaseStream.CopyToAsync(memory, cancellationToken).ConfigureAwait(false);
+        var stdout = process.StandardOutput.BaseStream;
+        var bytes = new byte[64 * 1024];
+        var samples = new float[bytes.Length / sizeof(float)];
+        var carried = 0;
+        long total = 0;
+        int read;
+        while ((read = await stdout.ReadAsync(bytes.AsMemory(carried), cancellationToken).ConfigureAwait(false)) > 0)
+        {
+            var have = carried + read;
+            var whole = have / sizeof(float);
+            if (whole > 0)
+            {
+                Buffer.BlockCopy(bytes, 0, samples, 0, whole * sizeof(float));
+                onSamples(samples, whole);
+                total += whole;
+            }
+
+            // A read can end mid-sample: the leftover bytes start the next piece.
+            carried = have - (whole * sizeof(float));
+            Buffer.BlockCopy(bytes, whole * sizeof(float), bytes, 0, carried);
+        }
+
         await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
 
         if (process.ExitCode != 0)
@@ -81,10 +108,6 @@ public class FfmpegAudioDecoder
             throw new InvalidOperationException($"ffmpeg exited with code {process.ExitCode}");
         }
 
-        var bytes = memory.ToArray();
-        var sampleCount = bytes.Length / sizeof(float);
-        var samples = new float[sampleCount];
-        Buffer.BlockCopy(bytes, 0, samples, 0, sampleCount * sizeof(float));
-        return samples;
+        return total;
     }
 }

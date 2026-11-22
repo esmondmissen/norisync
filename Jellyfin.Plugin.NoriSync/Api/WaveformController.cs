@@ -70,6 +70,7 @@ public class WaveformController : ControllerBase
     /// <param name="startIndex">Zero-based offset within the result set (default 0).</param>
     /// <param name="limit">Maximum items per page (default 100, max 500).</param>
     /// <param name="libraryIds">Library ids to restrict results to tracks reachable through those libraries. Required; repeat the query parameter for multiple values.</param>
+    /// <param name="omitUnchangedWaveforms">Leave out the waveform of a row whose waveform hasn't changed since <paramref name="since"/> (the client holds it), marking it <c>WaveformUnchanged</c>. Off by default: an older client reads a null waveform as "none".</param>
     /// <returns>A page of waveform records.</returns>
     [HttpGet("changes")]
     [ProducesResponseType(StatusCodes.Status200OK)]
@@ -82,7 +83,8 @@ public class WaveformController : ControllerBase
         [FromQuery] string? until = null,
         [FromQuery] int startIndex = 0,
         [FromQuery] int limit = 100,
-        [FromQuery] Guid[]? libraryIds = null)
+        [FromQuery] Guid[]? libraryIds = null,
+        [FromQuery] bool omitUnchangedWaveforms = false)
     {
         var store = Plugin.Instance?.FeatureStore;
         if (store == null)
@@ -130,17 +132,11 @@ public class WaveformController : ControllerBase
         var totalCount = store.CountProcessedSince(sinceDate, untilDate, librarySet);
         var features = store.GetProcessedSince(sinceDate, untilDate, librarySet, limit, startIndex);
 
+        var omitBefore = omitUnchangedWaveforms && !string.IsNullOrEmpty(since) ? sinceDate : (DateTimeOffset?)null;
         var items = new List<WaveformChangeDto>(features.Count);
         foreach (var f in features)
         {
-            items.Add(new WaveformChangeDto
-            {
-                ItemId = f.ItemId,
-                ProcessedAt = f.ProcessedAt,
-                SourceMtime = f.SourceMtime,
-                Waveform = f.Waveform,
-                WaveformVersion = f.WaveformVersion
-            });
+            items.Add(ToDto(f, omitBefore));
         }
 
         var response = new WaveformChangesResponse
@@ -158,6 +154,29 @@ public class WaveformController : ControllerBase
         }
 
         return Ok(response);
+    }
+
+    /// <summary>
+    /// One feed row. <paramref name="omitWaveformThrough"/>: the cursor of a client that asked for
+    /// unchanged waveforms to be left out — a waveform last changed at or before it went out then.
+    /// </summary>
+    /// <param name="feature">The stored record.</param>
+    /// <param name="omitWaveformThrough">The client's cursor, or null to send every waveform.</param>
+    /// <returns>The wire row.</returns>
+    internal static WaveformChangeDto ToDto(TrackFeature feature, DateTimeOffset? omitWaveformThrough)
+    {
+        var unchanged = omitWaveformThrough is { } cursor && feature.WaveformChangedAt <= cursor;
+        return new WaveformChangeDto
+        {
+            ItemId = feature.ItemId,
+            ProcessedAt = feature.ProcessedAt,
+            SourceMtime = feature.SourceMtime,
+            Waveform = unchanged ? null : feature.Waveform,
+            WaveformVersion = feature.WaveformVersion,
+            WaveformUnchanged = unchanged,
+            MixProfile = feature.MixProfile,
+            MixProfileVersion = MixProfileAnalyzer.WireVersion(feature.MixProfileVersion)
+        };
     }
 
     private static HashSet<Guid>? NormalizeLibraryIds(Guid[]? libraryIds)

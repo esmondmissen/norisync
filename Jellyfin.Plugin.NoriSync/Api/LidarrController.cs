@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -36,33 +37,47 @@ namespace Jellyfin.Plugin.NoriSync.Api;
 [Authorize]
 public class LidarrController : ControllerBase
 {
-    private readonly LidarrClient _client;
+    private readonly AlbumBackends _backends;
     private readonly RemoteImageFetcher _imageFetcher;
     private readonly MusicBrainzClient _musicBrainz;
     private readonly IMemoryCache _cache;
     private readonly ILogger<LidarrController> _logger;
 
     /// <summary>
+    /// The backend this request talks to: where new album requests go, unless the route acts on
+    /// a request already made (<see cref="UseBackendHolding"/>) or on Lidarr's own settings.
+    /// </summary>
+    private AlbumBackend _backend;
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="LidarrController"/> class.
     /// </summary>
-    /// <param name="client">Lidarr forwarder.</param>
+    /// <param name="backends">The album backends (Lidarr, SoulSync's Lidarr-compatible API).</param>
     /// <param name="imageFetcher">Fetcher for external cover-art URLs.</param>
     /// <param name="musicBrainz">MusicBrainz client used for discovery fallbacks.</param>
     /// <param name="cache">Memory cache used to dedupe lookups (covers, discographies).</param>
     /// <param name="logger">Logger.</param>
     public LidarrController(
-        LidarrClient client,
+        AlbumBackends backends,
         RemoteImageFetcher imageFetcher,
         MusicBrainzClient musicBrainz,
         IMemoryCache cache,
         ILogger<LidarrController> logger)
     {
-        _client = client;
+        ArgumentNullException.ThrowIfNull(backends);
+        _backends = backends;
+        _backend = backends.Active ?? backends.Lidarr;
         _imageFetcher = imageFetcher;
         _musicBrainz = musicBrainz;
         _cache = cache;
         _logger = logger;
     }
+
+    private LidarrClient Upstream => _backend.Client;
+
+    private AlbumSearchScheduler Scheduler => _backend.Scheduler;
+
+    private string BackendName => _backend.Name;
 
     /// <summary>
     /// Searches Lidarr (and the MusicBrainz catalog it sits in front of) for artists and
@@ -94,9 +109,9 @@ public class LidarrController : ControllerBase
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> ArtistAlbums(string mbid)
     {
-        if (_client.TryGetBaseUri() == null)
+        if (Upstream.TryGetBaseUri() == null)
         {
-            return ServiceUnavailable("Lidarr is not configured on this server.");
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
         }
 
         try
@@ -133,6 +148,63 @@ public class LidarrController : ControllerBase
     }
 
     /// <summary>
+    /// Whether Lidarr follows an artist: in Lidarr at all, monitored, and its rule for albums
+    /// it discovers later. For the artist page's "Monitor Artist" toggle.
+    /// </summary>
+    /// <param name="mbid">MusicBrainz artist id.</param>
+    /// <returns>The artist's <see cref="ArtistMonitoring"/>.</returns>
+    [HttpGet("artists/{mbid}/monitoring")]
+    [Produces(MediaTypeNames.Application.Json)]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    public Task<IActionResult> ArtistMonitoringState(string mbid)
+        => RunArtistMonitoringAsync(mbid, ct => _backend.ArtistMonitoring.GetAsync(mbid, ct));
+
+    /// <summary>
+    /// Changes whether Lidarr follows an artist. Fields left out stay as they are. Monitoring an
+    /// artist Lidarr hasn't got adds it following only future releases (its existing albums
+    /// unmonitored), with the configured root folder and profiles. The artist's albums keep
+    /// their own monitored flags either way. Gated by <c>LidarrRequireAdmin</c>.
+    /// </summary>
+    /// <param name="mbid">MusicBrainz artist id.</param>
+    /// <param name="body">The change.</param>
+    /// <returns>The artist's <see cref="ArtistMonitoring"/> afterwards.</returns>
+    [HttpPut("artists/{mbid}/monitoring")]
+    [Produces(MediaTypeNames.Application.Json)]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    public Task<IActionResult> SetArtistMonitoring(string mbid, [FromBody] ArtistMonitoringRequest body)
+    {
+        var config = Plugin.Instance?.Configuration;
+        var user = GetJellyfinUser();
+        if (user == null || (config?.LidarrRequireAdmin == true && !IsAdministrator(user)))
+        {
+            return Task.FromResult<IActionResult>(Forbid());
+        }
+
+        if (body == null || (body.MonitorNewItems != null && !LidarrArtistMonitoring.IsNewItemRule(body.MonitorNewItems)))
+        {
+            return Task.FromResult<IActionResult>(BadRequest(new { Error = "MonitorNewItems must be 'all', 'none' or 'new'." }));
+        }
+
+        return RunArtistMonitoringAsync(mbid, async ct =>
+        {
+            var defaults = await _backend.GetAddDefaultsAsync(ct).ConfigureAwait(false);
+            var state = await _backend.ArtistMonitoring.SetAsync(mbid, body, defaults, ct).ConfigureAwait(false);
+            _logger.LogInformation(
+                "Lidarr artist monitoring: user={UserId} mbid={Mbid} inLidarr={InLidarr} monitored={Monitored} newItems={NewItems}",
+                user.Id,
+                mbid,
+                state.InLidarr,
+                state.Monitored,
+                state.MonitorNewItems);
+            return state;
+        });
+    }
+
+    /// <summary>
     /// Lists the tracks on an album, normalized into a single shape regardless of whether
     /// the album is already in Lidarr's library. If the album is imported we use Lidarr's
     /// <c>/track</c> endpoint (which carries <c>hasFile</c>); if not, we fall back to
@@ -148,21 +220,27 @@ public class LidarrController : ControllerBase
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> AlbumTracks(string mbid)
     {
-        if (_client.TryGetBaseUri() == null)
+        // Song requests need the tracklist's recording ids even with no album backend: then it
+        // comes from MusicBrainz alone.
+        var songsOnly = !_backend.IsConfigured && HttpContext.RequestServices.GetRequiredService<SoulSyncClient>().IsConfigured;
+        if (Upstream.TryGetBaseUri() == null && !songsOnly)
         {
-            return ServiceUnavailable("Lidarr is not configured on this server.");
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
         }
 
         // Library path first.
-        int? albumId;
+        int? albumId = null;
         try
         {
-            albumId = await ResolveAlbumIdAsync(mbid, HttpContext.RequestAborted).ConfigureAwait(false);
+            if (_backend.ListsAlbumTracks && !songsOnly)
+            {
+                albumId = await ResolveAlbumIdAsync(mbid, HttpContext.RequestAborted).ConfigureAwait(false);
+            }
         }
         catch (HttpRequestException ex)
         {
             _logger.LogWarning(ex, "Lidarr unreachable while resolving album id for {Mbid}", mbid);
-            return ServiceUnavailable("Lidarr is unreachable.");
+            return ServiceUnavailable(BackendName + " is unreachable.");
         }
         catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
         {
@@ -171,7 +249,7 @@ public class LidarrController : ControllerBase
         catch (TaskCanceledException ex)
         {
             _logger.LogWarning(ex, "Lidarr album-id lookup for {Mbid} timed out", mbid);
-            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = "Lidarr timed out." });
+            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = BackendName + " timed out." });
         }
 
         if (albumId.HasValue)
@@ -184,7 +262,7 @@ public class LidarrController : ControllerBase
             catch (HttpRequestException ex)
             {
                 _logger.LogWarning(ex, "Lidarr unreachable while fetching tracks for album id {AlbumId}", albumId.Value);
-                return ServiceUnavailable("Lidarr is unreachable.");
+                return ServiceUnavailable(BackendName + " is unreachable.");
             }
             catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
             {
@@ -193,7 +271,7 @@ public class LidarrController : ControllerBase
             catch (TaskCanceledException ex)
             {
                 _logger.LogWarning(ex, "Lidarr track fetch for album id {AlbumId} timed out", albumId.Value);
-                return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = "Lidarr timed out." });
+                return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = BackendName + " timed out." });
             }
         }
 
@@ -244,13 +322,13 @@ public class LidarrController : ControllerBase
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> RequestAlbum(string mbid)
     {
-        if (_client.TryGetBaseUri() == null)
+        if (Upstream.TryGetBaseUri() == null)
         {
-            return ServiceUnavailable("Lidarr is not configured on this server.");
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
         }
 
         var config = Plugin.Instance?.Configuration;
-        var store = Plugin.Instance?.RequestsStore;
+        var store = _backend.Store;
         if (config == null || store == null)
         {
             return ServiceUnavailable("Plugin not initialized.");
@@ -267,18 +345,19 @@ public class LidarrController : ControllerBase
             return Forbid();
         }
 
-        if (string.IsNullOrWhiteSpace(config.LidarrRootFolderPath)
-            || config.LidarrQualityProfileId <= 0
-            || config.LidarrMetadataProfileId <= 0)
-        {
-            return BadRequest(new { Error = "Lidarr defaults (root folder, quality profile, metadata profile) are not configured." });
-        }
-
         try
         {
+            var defaults = await _backend.GetAddDefaultsAsync(HttpContext.RequestAborted).ConfigureAwait(false);
+            if (!defaults.IsComplete)
+            {
+                return _backend.Kind == RequestBackend.SoulSync
+                    ? ServiceUnavailable("SoulSync's root folder and profiles couldn't be read.")
+                    : BadRequest(new { Error = "Lidarr defaults (root folder, quality profile, metadata profile) are not configured." });
+            }
+
             // 1. Lookup the album metadata Lidarr/MusicBrainz knows about.
             JsonNode? lookupRoot;
-            using (var lookupResp = await _client.SendAsync(
+            using (var lookupResp = await Upstream.SendAsync(
                 HttpMethod.Get,
                 "album/lookup",
                 $"?term=lidarr:{Uri.EscapeDataString(mbid)}",
@@ -288,7 +367,7 @@ public class LidarrController : ControllerBase
             {
                 if (!lookupResp.IsSuccessStatusCode)
                 {
-                    return ServiceUnavailable("Lidarr lookup failed.");
+                    return ServiceUnavailable(BackendName + " lookup failed.");
                 }
 
                 var lookupBytes = await lookupResp.Content.ReadAsByteArrayAsync(HttpContext.RequestAborted).ConfigureAwait(false);
@@ -304,28 +383,31 @@ public class LidarrController : ControllerBase
             var album = lookupArr[0]!.DeepClone().AsObject();
             album["monitored"] = true;
             album["anyReleaseOk"] = true;
-            album["qualityProfileId"] = config.LidarrQualityProfileId;
-            album["metadataProfileId"] = config.LidarrMetadataProfileId;
-            album["addOptions"] = new JsonObject { ["searchForNewAlbum"] = true };
+            album["qualityProfileId"] = defaults.QualityProfileId;
+            album["metadataProfileId"] = defaults.MetadataProfileId;
+            // The plugin searches itself (AlbumSearchScheduler): Lidarr's searchForNewAlbum
+            // never runs for a new artist and fires a stray search a day later instead.
+            album["addOptions"] = new JsonObject { ["searchForNewAlbum"] = false };
 
             if (album["artist"] is JsonObject artistObj)
             {
-                artistObj["qualityProfileId"] = config.LidarrQualityProfileId;
-                artistObj["metadataProfileId"] = config.LidarrMetadataProfileId;
-                artistObj["rootFolderPath"] = config.LidarrRootFolderPath;
+                // Only read when the artist is new (an existing artist keeps its own settings).
+                // Monitor just this album: "all" with a real metadata profile monitored the
+                // whole discography, and RSS then downloaded every album of it.
+                artistObj["qualityProfileId"] = defaults.QualityProfileId;
+                artistObj["metadataProfileId"] = defaults.MetadataProfileId;
+                artistObj["rootFolderPath"] = defaults.RootFolderPath;
                 artistObj["monitored"] = true;
-                artistObj["addOptions"] = new JsonObject
-                {
-                    ["monitor"] = "all",
-                    ["searchForMissingAlbums"] = false
-                };
+                artistObj["monitorNewItems"] = "none";
+                artistObj["tags"] ??= new JsonArray();
+                artistObj["addOptions"] = BuildNewArtistAddOptions(mbid);
             }
 
             // 3. POST to Lidarr.
             var postContent = new ByteArrayContent(Encoding.UTF8.GetBytes(album.ToJsonString()));
             postContent.Headers.ContentType = new MediaTypeHeaderValue(MediaTypeNames.Application.Json);
 
-            using var addResp = await _client.SendAsync(
+            using var addResp = await Upstream.SendAsync(
                 HttpMethod.Post,
                 "album",
                 queryString: null,
@@ -350,17 +432,10 @@ public class LidarrController : ControllerBase
                     var existingId = (int?)existing?["id"] ?? 0;
                     if (existing != null && existingId > 0)
                     {
+                        // Monitored so it reads as wanted in Lidarr. The artist is left as the
+                        // user set it: AlbumSearch doesn't check monitoring, and the schedule
+                        // stands in for the RSS an unmonitored artist misses.
                         await EnsureAlbumMonitoredAsync(existingId, HttpContext.RequestAborted).ConfigureAwait(false);
-
-                        // AlbumSearch silently no-ops on an unmonitored artist, so a
-                        // re-request also has to flip the artist back on. The explicit
-                        // user click is strong intent; any artist-level side effects
-                        // (RSS-grabs of other albums) are recoverable in one click from
-                        // Lidarr's UI.
-                        if ((int?)existing["artist"]?["id"] is int existingArtistId && existingArtistId > 0)
-                        {
-                            await EnsureArtistMonitoredAsync(existingArtistId, HttpContext.RequestAborted).ConfigureAwait(false);
-                        }
 
                         var existingTitle = (string?)existing["title"];
                         var existingArtistName = (string?)existing["artist"]?["artistName"];
@@ -385,9 +460,10 @@ public class LidarrController : ControllerBase
                             mbid,
                             existingTitle);
 
-                        await TriggerAlbumSearchAsync(existingId, HttpContext.RequestAborted).ConfigureAwait(false);
+                        await Scheduler.RestartAsync(store, AlbumSearchScheduler.Fresh(existingId, existingNow), HttpContext.RequestAborted).ConfigureAwait(false);
+                        await SearchNowIfReadyAsync(store, existingId, HttpContext.RequestAborted).ConfigureAwait(false);
 
-                        return Ok(existingRecord);
+                        return Ok(FindRecord(store, user.Id, existingId) ?? existingRecord);
                     }
                 }
 
@@ -401,7 +477,7 @@ public class LidarrController : ControllerBase
             if (addedAlbumId == 0)
             {
                 _logger.LogWarning("Lidarr POST /album returned 2xx but no id; body: {Body}", Encoding.UTF8.GetString(addBytes));
-                return ServiceUnavailable("Lidarr returned an unexpected response.");
+                return ServiceUnavailable(BackendName + " returned an unexpected response.");
             }
 
             var title = (string?)addedNode?["title"];
@@ -428,28 +504,22 @@ public class LidarrController : ControllerBase
                 mbid,
                 title);
 
-            // If the artist already existed in Lidarr, the artist payload we attached to
-            // the POST is ignored — so an unmonitored existing artist stays unmonitored
-            // and AlbumSearch would silently no-op. Mirror the re-request branch and flip
-            // the artist back on. Cheap no-op when the artist is already monitored.
-            if ((int?)addedNode?["artist"]?["id"] is int addedArtistId && addedArtistId > 0)
+            // No search here: the album's releases load in a refresh that runs after this
+            // POST, and a search before then rejects every sized result. The schedule
+            // searches once they're in (the request sync, every minute).
+            await Scheduler.RestartAsync(store, AlbumSearchScheduler.Fresh(addedAlbumId, now), HttpContext.RequestAborted).ConfigureAwait(false);
+            if (_backend.Kind == RequestBackend.SoulSync)
             {
-                await EnsureArtistMonitoredAsync(addedArtistId, HttpContext.RequestAborted).ConfigureAwait(false);
+                // SoulSync reads the tracklist itself when it searches: nothing to wait for.
+                await SearchNowIfReadyAsync(store, addedAlbumId, HttpContext.RequestAborted).ConfigureAwait(false);
             }
 
-            // Lidarr's `addOptions.searchForNewAlbum` is unreliable when the artist is
-            // imported in the same call — the AlbumAddedEvent's AlbumSearchCommand can race
-            // ahead of the RefreshAlbum that pulls releases from MusicBrainz, and the
-            // search then exits silently with no releases to grab. Explicitly queuing
-            // AlbumSearch here lets Lidarr's command queue serialize it after the refresh.
-            await TriggerAlbumSearchAsync(addedAlbumId, HttpContext.RequestAborted).ConfigureAwait(false);
-
-            return Ok(record);
+            return Ok(FindRecord(store, user.Id, addedAlbumId) ?? record);
         }
         catch (HttpRequestException ex)
         {
             _logger.LogWarning(ex, "Lidarr unreachable while requesting album {Mbid}", mbid);
-            return ServiceUnavailable("Lidarr is unreachable.");
+            return ServiceUnavailable(BackendName + " is unreachable.");
         }
         catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
         {
@@ -458,32 +528,40 @@ public class LidarrController : ControllerBase
         catch (TaskCanceledException ex)
         {
             _logger.LogWarning(ex, "Lidarr request for album {Mbid} timed out", mbid);
-            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = "Lidarr timed out." });
+            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = BackendName + " timed out." });
         }
     }
 
     /// <summary>
     /// Runs an interactive (manual) search for an album: asks Lidarr to query its configured
     /// indexers and returns the raw list of release candidates unchanged (Lidarr's
-    /// <c>GET /release?albumId=...</c>). The album must already exist in Lidarr — interactive
+    /// <c>GET /release?albumId=...</c>), as <see cref="ReleaseCandidate"/>s (no download URLs).
+    /// The album must already exist in Lidarr — interactive
     /// search operates on Lidarr's internal album id, which discovery-only albums don't have
     /// yet; callers get a <c>409</c> with <c>Code="album_not_in_lidarr"</c> in that case.
     /// Gated by <c>LidarrRequireAdmin</c>, since each call loads the indexers and exposes
     /// download URLs.
     /// </summary>
     /// <param name="mbid">MusicBrainz release-group id.</param>
-    /// <returns>Lidarr's release-candidate array, passed through.</returns>
+    /// <returns>The candidates, in Lidarr's ranking.</returns>
     [HttpGet("albums/{mbid}/releases")]
     [Produces(MediaTypeNames.Application.Json)]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status501NotImplemented)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> AlbumReleases(string mbid)
     {
-        if (_client.TryGetBaseUri() == null)
+        UseBackendOfCallersRequest(mbid);
+        if (!_backend.SupportsInteractiveSearch && _backend.IsConfigured)
         {
-            return ServiceUnavailable("Lidarr is not configured on this server.");
+            return InteractiveSearchUnsupported();
+        }
+
+        if (Upstream.TryGetBaseUri() == null)
+        {
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
         }
 
         var config = Plugin.Instance?.Configuration;
@@ -510,22 +588,34 @@ public class LidarrController : ControllerBase
             {
                 return Conflict(new
                 {
-                    Error = "This album is not in Lidarr yet. Add it before running an interactive search.",
+                    Error = "This album is not in " + BackendName + " yet. Add it before running an interactive search.",
                     Code = "album_not_in_lidarr"
                 });
             }
 
-            // Request-gate already applied above; forward the interactive search pass-through.
-            return await ForwardJsonAsync(
+            using var upstream = await Upstream.SendAsync(
                 HttpMethod.Get,
                 "release",
-                adminOnly: false,
-                queryStringOverride: $"?albumId={albumId.Value}").ConfigureAwait(false);
+                "?albumId=" + albumId.Value.ToString(CultureInfo.InvariantCulture),
+                body: null,
+                HttpCompletionOption.ResponseContentRead,
+                HttpContext.RequestAborted,
+                LidarrClient.InteractiveSearchTimeout).ConfigureAwait(false);
+
+            if (!upstream.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Lidarr interactive search for album {AlbumId} returned {Status}", albumId.Value, (int)upstream.StatusCode);
+                return ServiceUnavailable(BackendName + "'s search failed.");
+            }
+
+            var bytes = await upstream.Content.ReadAsByteArrayAsync(HttpContext.RequestAborted).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(bytes);
+            return Ok(ReleaseCandidate.FromLidarr(doc.RootElement));
         }
         catch (HttpRequestException ex)
         {
             _logger.LogWarning(ex, "Lidarr unreachable while resolving album id for interactive search of {Mbid}", mbid);
-            return ServiceUnavailable("Lidarr is unreachable.");
+            return ServiceUnavailable(BackendName + " is unreachable.");
         }
         catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
         {
@@ -533,8 +623,13 @@ public class LidarrController : ControllerBase
         }
         catch (TaskCanceledException ex)
         {
-            _logger.LogWarning(ex, "Interactive search album-id lookup for {Mbid} timed out", mbid);
-            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = "Lidarr timed out." });
+            _logger.LogWarning(ex, "Interactive search for {Mbid} timed out", mbid);
+            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = BackendName + " timed out." });
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Lidarr answered the interactive search for {Mbid} with something that isn't JSON", mbid);
+            return ServiceUnavailable(BackendName + " returned an unexpected response.");
         }
     }
 
@@ -556,16 +651,24 @@ public class LidarrController : ControllerBase
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status410Gone)]
+    [ProducesResponseType(StatusCodes.Status501NotImplemented)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> GrabRelease(string mbid, [FromBody] GrabReleaseRequest body)
     {
-        if (_client.TryGetBaseUri() == null)
+        UseBackendOfCallersRequest(mbid);
+        if (!_backend.SupportsInteractiveSearch && _backend.IsConfigured)
         {
-            return ServiceUnavailable("Lidarr is not configured on this server.");
+            return InteractiveSearchUnsupported();
+        }
+
+        if (Upstream.TryGetBaseUri() == null)
+        {
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
         }
 
         var config = Plugin.Instance?.Configuration;
-        var store = Plugin.Instance?.RequestsStore;
+        var store = _backend.Store;
         if (config == null || store == null)
         {
             return ServiceUnavailable("Plugin not initialized.");
@@ -597,30 +700,22 @@ public class LidarrController : ControllerBase
             {
                 return Conflict(new
                 {
-                    Error = "This album is not in Lidarr yet. Add it before grabbing a release.",
+                    Error = "This album is not in " + BackendName + " yet. Add it before grabbing a release.",
                     Code = "album_not_in_lidarr"
                 });
             }
 
-            // Mirror the request flow's monitoring guarantees so the grabbed download is
-            // imported and the album reads as wanted. Best-effort; failures don't block the grab.
+            // As a request: the album reads as wanted; the artist keeps the user's setting.
+            // Best-effort; a failure doesn't block the grab.
             await EnsureAlbumMonitoredAsync(existingId, HttpContext.RequestAborted).ConfigureAwait(false);
-            if ((int?)existing["artist"]?["id"] is int artistId && artistId > 0)
-            {
-                await EnsureArtistMonitoredAsync(artistId, HttpContext.RequestAborted).ConfigureAwait(false);
-            }
 
             // Grab the specific release. Lidarr resolves the cached RemoteAlbum from guid+indexerId
             // (populated by the preceding interactive search) and sends it to the download client.
-            var grabBody = new JsonObject
-            {
-                ["guid"] = body.Guid,
-                ["indexerId"] = body.IndexerId
-            };
+            var grabBody = BuildGrabBody(body.Guid, body.IndexerId, existingId, (int?)existing["artist"]?["id"] ?? (int?)existing["artistId"]);
             var content = new ByteArrayContent(Encoding.UTF8.GetBytes(grabBody.ToJsonString()));
             content.Headers.ContentType = new MediaTypeHeaderValue(MediaTypeNames.Application.Json);
 
-            using var grabResp = await _client.SendAsync(
+            using var grabResp = await Upstream.SendAsync(
                 HttpMethod.Post,
                 "release",
                 queryString: null,
@@ -629,6 +724,17 @@ public class LidarrController : ControllerBase
                 HttpContext.RequestAborted).ConfigureAwait(false);
 
             var grabBytes = await grabResp.Content.ReadAsByteArrayAsync(HttpContext.RequestAborted).ConfigureAwait(false);
+
+            if (grabResp.StatusCode == HttpStatusCode.NotFound)
+            {
+                // Lidarr keeps a search's results for 30 minutes; after that it can't find the
+                // guid. Not a 404 to the client, which reads that as a plugin without the route.
+                return StatusCode(StatusCodes.Status410Gone, new
+                {
+                    Error = "These search results have expired. Search again.",
+                    Code = "release_expired"
+                });
+            }
 
             if (!grabResp.IsSuccessStatusCode)
             {
@@ -656,6 +762,7 @@ public class LidarrController : ControllerBase
                 StatusUpdatedAt = now
             };
             store.Upsert(record);
+            await Scheduler.RestartAsync(store, AlbumSearchScheduler.AfterGrab(existingId, now), HttpContext.RequestAborted).ConfigureAwait(false);
 
             _logger.LogInformation(
                 "Lidarr interactive grab: user={UserId} albumId={AlbumId} mbid={Mbid} indexer={IndexerId} title={Title}",
@@ -665,12 +772,12 @@ public class LidarrController : ControllerBase
                 body.IndexerId,
                 record.AlbumTitle);
 
-            return Ok(record);
+            return Ok(FindRecord(store, user.Id, existingId) ?? record);
         }
         catch (HttpRequestException ex)
         {
             _logger.LogWarning(ex, "Lidarr unreachable while grabbing release for album {Mbid}", mbid);
-            return ServiceUnavailable("Lidarr is unreachable.");
+            return ServiceUnavailable(BackendName + " is unreachable.");
         }
         catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
         {
@@ -679,7 +786,100 @@ public class LidarrController : ControllerBase
         catch (TaskCanceledException ex)
         {
             _logger.LogWarning(ex, "Lidarr grab for album {Mbid} timed out", mbid);
-            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = "Lidarr timed out." });
+            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = BackendName + " timed out." });
+        }
+    }
+
+    /// <summary>
+    /// "Search Again": starts the album's search schedule over (a fresh retry window) and
+    /// searches at once if Lidarr has its releases; otherwise the request sync searches as soon
+    /// as they load. The album must be in Lidarr (<c>409</c>, <c>album_not_in_lidarr</c>). Tracks
+    /// the album for the caller if they had no request for it. Gated by <c>LidarrRequireAdmin</c>.
+    /// </summary>
+    /// <param name="mbid">MusicBrainz release-group id.</param>
+    /// <returns>The caller's tracking row for the album, search fields included.</returns>
+    [HttpPost("albums/{mbid}/search")]
+    [Produces(MediaTypeNames.Application.Json)]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    public async Task<IActionResult> SearchAlbum(string mbid)
+    {
+        UseBackendOfCallersRequest(mbid);
+        if (Upstream.TryGetBaseUri() == null)
+        {
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
+        }
+
+        var config = Plugin.Instance?.Configuration;
+        var store = _backend.Store;
+        if (config == null || store == null)
+        {
+            return ServiceUnavailable("Plugin not initialized.");
+        }
+
+        var user = GetJellyfinUser();
+        if (user == null)
+        {
+            return Forbid();
+        }
+
+        if (config.LidarrRequireAdmin && !IsAdministrator(user))
+        {
+            return Forbid();
+        }
+
+        try
+        {
+            var existing = await FetchAlbumByMbidAsync(mbid, HttpContext.RequestAborted).ConfigureAwait(false);
+            var albumId = (int?)existing?["id"] ?? 0;
+            if (existing == null || albumId <= 0)
+            {
+                return Conflict(new
+                {
+                    Error = "This album is not in " + BackendName + " yet. Request it first.",
+                    Code = "album_not_in_lidarr"
+                });
+            }
+
+            await EnsureAlbumMonitoredAsync(albumId, HttpContext.RequestAborted).ConfigureAwait(false);
+
+            var now = DateTimeOffset.UtcNow;
+            if (FindRecord(store, user.Id, albumId) == null)
+            {
+                store.Upsert(new RequestRecord
+                {
+                    JellyfinUserId = user.Id,
+                    LidarrAlbumId = albumId,
+                    AlbumMbid = mbid,
+                    AlbumTitle = (string?)existing["title"],
+                    ArtistName = (string?)existing["artist"]?["artistName"],
+                    SubmittedAt = now,
+                    Status = RequestStatus.Pending,
+                    StatusUpdatedAt = now
+                });
+            }
+
+            await Scheduler.RestartAsync(store, AlbumSearchScheduler.Fresh(albumId, now), HttpContext.RequestAborted).ConfigureAwait(false);
+            await SearchNowIfReadyAsync(store, albumId, HttpContext.RequestAborted).ConfigureAwait(false);
+
+            _logger.LogInformation("Lidarr search again: user={UserId} albumId={AlbumId} mbid={Mbid}", user.Id, albumId, mbid);
+            return Ok(FindRecord(store, user.Id, albumId));
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogWarning(ex, "Lidarr unreachable while searching again for album {Mbid}", mbid);
+            return ServiceUnavailable(BackendName + " is unreachable.");
+        }
+        catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (TaskCanceledException ex)
+        {
+            _logger.LogWarning(ex, "Search again for album {Mbid} timed out", mbid);
+            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = BackendName + " timed out." });
         }
     }
 
@@ -696,8 +896,8 @@ public class LidarrController : ControllerBase
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     public IActionResult ListRequests([FromQuery] Guid? userId, [FromQuery] bool all = false)
     {
-        var store = Plugin.Instance?.RequestsStore;
-        if (store == null)
+        var stores = _backends.All.Select(b => b.Store).OfType<RequestsStore>().ToList();
+        if (stores.Count == 0)
         {
             return Ok(Array.Empty<RequestRecord>());
         }
@@ -717,7 +917,7 @@ public class LidarrController : ControllerBase
                 return Forbid();
             }
 
-            return Ok(store.ListAll());
+            return Ok(stores.SelectMany(s => s.ListAll()).ToList());
         }
 
         if (userId.HasValue && userId.Value != user.Id)
@@ -727,10 +927,10 @@ public class LidarrController : ControllerBase
                 return Forbid();
             }
 
-            return Ok(store.ListByUser(userId.Value));
+            return Ok(stores.SelectMany(s => s.ListByUser(userId.Value)).ToList());
         }
 
-        return Ok(store.ListByUser(user.Id));
+        return Ok(stores.SelectMany(s => s.ListByUser(user.Id)).ToList());
     }
 
     /// <summary>
@@ -746,9 +946,9 @@ public class LidarrController : ControllerBase
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> Queue()
     {
-        if (_client.TryGetBaseUri() == null)
+        if (Upstream.TryGetBaseUri() == null)
         {
-            return ServiceUnavailable("Lidarr is not configured on this server.");
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
         }
 
         var user = GetJellyfinUser();
@@ -761,7 +961,7 @@ public class LidarrController : ControllerBase
         HashSet<int>? allowedAlbumIds = null;
         if (!isAdmin)
         {
-            var store = Plugin.Instance?.RequestsStore;
+            var store = _backend.Store;
             allowedAlbumIds = store?.GetAlbumIdsForUser(user.Id) ?? new HashSet<int>();
             if (allowedAlbumIds.Count == 0)
             {
@@ -777,7 +977,7 @@ public class LidarrController : ControllerBase
 
         try
         {
-            using var upstream = await _client.SendAsync(
+            using var upstream = await Upstream.SendAsync(
                 HttpMethod.Get,
                 "queue",
                 Request.QueryString.HasValue ? Request.QueryString.Value : null,
@@ -820,7 +1020,7 @@ public class LidarrController : ControllerBase
         catch (HttpRequestException ex)
         {
             _logger.LogWarning(ex, "Lidarr queue fetch failed");
-            return ServiceUnavailable("Lidarr is unreachable.");
+            return ServiceUnavailable(BackendName + " is unreachable.");
         }
         catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
         {
@@ -829,7 +1029,7 @@ public class LidarrController : ControllerBase
         catch (TaskCanceledException ex)
         {
             _logger.LogWarning(ex, "Lidarr queue fetch timed out");
-            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = "Lidarr timed out." });
+            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = BackendName + " timed out." });
         }
     }
 
@@ -837,30 +1037,42 @@ public class LidarrController : ControllerBase
     /// Cancels a tracked request: unmonitors the album in Lidarr and removes the matching
     /// row(s) from the requests store. Non-admins can only cancel their own rows.
     /// </summary>
-    /// <param name="lidarrAlbumId">The Lidarr album id.</param>
+    /// <param name="lidarrAlbumId">The album id on its backend.</param>
+    /// <param name="backend">The backend holding the request (the record's <c>Backend</c>). An
+    /// older app sends none: the store holding the id for the caller is used, the active one
+    /// first.</param>
     /// <returns>204 on success, 404 if the caller has no row for this album.</returns>
     [HttpDelete("requests/{lidarrAlbumId:int}")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
-    public async Task<IActionResult> CancelRequest(int lidarrAlbumId)
+    public async Task<IActionResult> CancelRequest(int lidarrAlbumId, [FromQuery] RequestBackend? backend = null)
     {
-        if (_client.TryGetBaseUri() == null)
-        {
-            return ServiceUnavailable("Lidarr is not configured on this server.");
-        }
-
-        var store = Plugin.Instance?.RequestsStore;
-        if (store == null)
-        {
-            return NotFound();
-        }
-
         var user = GetJellyfinUser();
         if (user == null)
         {
             return Forbid();
+        }
+
+        if (backend is { } named)
+        {
+            _backend = _backends.For(named);
+        }
+        else if (_backend.Store?.GetAlbumIdsForUser(user.Id).Contains(lidarrAlbumId) != true)
+        {
+            UseBackendHolding(user.Id, mbid: null, lidarrAlbumId);
+        }
+
+        if (Upstream.TryGetBaseUri() == null)
+        {
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
+        }
+
+        var store = _backend.Store;
+        if (store == null)
+        {
+            return NotFound();
         }
 
         var isAdmin = IsAdministrator(user);
@@ -882,7 +1094,7 @@ public class LidarrController : ControllerBase
             var content = new ByteArrayContent(Encoding.UTF8.GetBytes(monitorBody.ToJsonString()));
             content.Headers.ContentType = new MediaTypeHeaderValue(MediaTypeNames.Application.Json);
 
-            using var resp = await _client.SendAsync(
+            using var resp = await Upstream.SendAsync(
                 HttpMethod.Put,
                 "album/monitor",
                 queryString: null,
@@ -960,7 +1172,10 @@ public class LidarrController : ControllerBase
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public Task<IActionResult> RootFolders()
-        => ForwardJsonAsync(HttpMethod.Get, "rootfolder", adminOnly: true);
+    {
+        _backend = _backends.Lidarr;
+        return ForwardJsonAsync(HttpMethod.Get, "rootfolder", adminOnly: true);
+    }
 
     /// <summary>
     /// Lists Lidarr's quality profiles. Used by the plugin configuration UI to populate the
@@ -973,7 +1188,10 @@ public class LidarrController : ControllerBase
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public Task<IActionResult> QualityProfiles()
-        => ForwardJsonAsync(HttpMethod.Get, "qualityprofile", adminOnly: true);
+    {
+        _backend = _backends.Lidarr;
+        return ForwardJsonAsync(HttpMethod.Get, "qualityprofile", adminOnly: true);
+    }
 
     /// <summary>
     /// Lists Lidarr's metadata profiles. Used by the plugin configuration UI to populate the
@@ -986,7 +1204,10 @@ public class LidarrController : ControllerBase
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public Task<IActionResult> MetadataProfiles()
-        => ForwardJsonAsync(HttpMethod.Get, "metadataprofile", adminOnly: true);
+    {
+        _backend = _backends.Lidarr;
+        return ForwardJsonAsync(HttpMethod.Get, "metadataprofile", adminOnly: true);
+    }
 
     /// <summary>
     /// Tries a Lidarr URL and API key from the request body, without saving them, and returns
@@ -1011,7 +1232,7 @@ public class LidarrController : ControllerBase
             return Forbid();
         }
 
-        return await _client.ProbeAsync(request.BaseUrl, request.ApiKey, HttpContext.RequestAborted).ConfigureAwait(false);
+        return await Upstream.ProbeAsync(request.BaseUrl, request.ApiKey, HttpContext.RequestAborted).ConfigureAwait(false);
     }
 
     private async Task<IActionResult> ForwardJsonAsync(
@@ -1020,9 +1241,9 @@ public class LidarrController : ControllerBase
         bool adminOnly,
         string? queryStringOverride = null)
     {
-        if (_client.TryGetBaseUri() == null)
+        if (Upstream.TryGetBaseUri() == null)
         {
-            return ServiceUnavailable("Lidarr is not configured on this server.");
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
         }
 
         if (adminOnly)
@@ -1039,7 +1260,7 @@ public class LidarrController : ControllerBase
 
         try
         {
-            using var upstream = await _client.SendAsync(
+            using var upstream = await Upstream.SendAsync(
                 method,
                 upstreamPath,
                 queryString,
@@ -1056,7 +1277,7 @@ public class LidarrController : ControllerBase
         catch (HttpRequestException ex)
         {
             _logger.LogWarning(ex, "Lidarr upstream call to {Path} failed", upstreamPath);
-            return ServiceUnavailable("Lidarr is unreachable.");
+            return ServiceUnavailable(BackendName + " is unreachable.");
         }
         catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
         {
@@ -1065,15 +1286,21 @@ public class LidarrController : ControllerBase
         catch (TaskCanceledException ex)
         {
             _logger.LogWarning(ex, "Lidarr upstream call to {Path} timed out", upstreamPath);
-            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = "Lidarr timed out." });
+            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = BackendName + " timed out." });
         }
     }
 
     private async Task<IActionResult> CoverAsync(string lookupPath, string mbid, string preferredCoverType)
     {
-        if (_client.TryGetBaseUri() == null)
+        // Lidarr's lookups carry fanart.tv images; SoulSync's compat API may have none for artists.
+        if (_backends.Lidarr.IsConfigured)
         {
-            return ServiceUnavailable("Lidarr is not configured on this server.");
+            _backend = _backends.Lidarr;
+        }
+
+        if (Upstream.TryGetBaseUri() == null)
+        {
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
         }
 
         string? remoteUrl;
@@ -1084,7 +1311,7 @@ public class LidarrController : ControllerBase
         catch (HttpRequestException ex)
         {
             _logger.LogWarning(ex, "Lidarr lookup for {Path}/{Mbid} failed", lookupPath, mbid);
-            return ServiceUnavailable("Lidarr is unreachable.");
+            return ServiceUnavailable(BackendName + " is unreachable.");
         }
         catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
         {
@@ -1184,7 +1411,7 @@ public class LidarrController : ControllerBase
     // GET /album?foreignAlbumId=<mbid> returns the existing album (or an empty array).
     private async Task<JsonObject?> FetchAlbumByMbidAsync(string mbid, CancellationToken cancellationToken)
     {
-        using var upstream = await _client.SendAsync(
+        using var upstream = await Upstream.SendAsync(
             HttpMethod.Get,
             "album",
             $"?foreignAlbumId={Uri.EscapeDataString(mbid)}",
@@ -1208,6 +1435,135 @@ public class LidarrController : ControllerBase
             : null;
     }
 
+    /// <summary>
+    /// The <c>addOptions</c> for an artist created by a request: only the requested album
+    /// monitored, and no artist-wide search (the plugin searches the one album itself).
+    /// </summary>
+    /// <param name="releaseGroupMbid">The requested album's release-group id.</param>
+    /// <returns>The add options.</returns>
+    internal static JsonObject BuildNewArtistAddOptions(string releaseGroupMbid) => new()
+    {
+        ["monitor"] = "all",
+        ["albumsToMonitor"] = new JsonArray(releaseGroupMbid),
+        ["searchForMissingAlbums"] = false
+    };
+
+    private async Task<IActionResult> RunArtistMonitoringAsync(string mbid, Func<CancellationToken, Task<ArtistMonitoring>> run)
+    {
+        if (Upstream.TryGetBaseUri() == null)
+        {
+            return ServiceUnavailable(BackendName + " is not configured on this server.");
+        }
+
+        // Lidarr binds `mbId` as a GUID: anything else is a 400 there, read as "refused".
+        if (!Guid.TryParse(mbid, out _))
+        {
+            return BadRequest(new { Error = "An artist MusicBrainz id is required." });
+        }
+
+        try
+        {
+            return Ok(await run(HttpContext.RequestAborted).ConfigureAwait(false));
+        }
+        catch (LidarrUpstreamException ex) when (ex.Status is HttpStatusCode.BadRequest or HttpStatusCode.NotFound)
+        {
+            _logger.LogWarning("Lidarr refused an artist monitoring change for {Mbid}: {Status} {Body}", mbid, (int)ex.Status, ex.Body);
+            return StatusCode((int)ex.Status, new { Error = ex.Status == HttpStatusCode.NotFound ? "Artist not found in MusicBrainz." : BackendName + " refused the change." });
+        }
+        catch (LidarrUpstreamException ex)
+        {
+            _logger.LogWarning("Lidarr artist monitoring for {Mbid} failed: {Status} {Body}", mbid, (int)ex.Status, ex.Body);
+            return ServiceUnavailable(BackendName + " answered with an error.");
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogWarning(ex, "Lidarr unreachable for artist monitoring of {Mbid}", mbid);
+            return ServiceUnavailable(BackendName + " is unreachable.");
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Lidarr answered artist monitoring for {Mbid} with something that isn't JSON", mbid);
+            return ServiceUnavailable(BackendName + " returned an unexpected response.");
+        }
+        catch (TaskCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (TaskCanceledException ex)
+        {
+            _logger.LogWarning(ex, "Lidarr artist monitoring for {Mbid} timed out", mbid);
+            return StatusCode(StatusCodes.Status504GatewayTimeout, new { Error = BackendName + " timed out." });
+        }
+    }
+
+    /// <summary>
+    /// Lidarr's <c>POST release</c> body. The album and artist ids let Lidarr grab a result it
+    /// couldn't match to an album by its title (<c>downloadAllowed: false</c>).
+    /// </summary>
+    /// <param name="guid">The result's guid.</param>
+    /// <param name="indexerId">The result's indexer id.</param>
+    /// <param name="albumId">The Lidarr album id.</param>
+    /// <param name="artistId">The Lidarr artist id, when known.</param>
+    /// <returns>The body.</returns>
+    internal static JsonObject BuildGrabBody(string guid, int indexerId, int albumId, int? artistId)
+    {
+        var body = new JsonObject
+        {
+            ["guid"] = guid,
+            ["indexerId"] = indexerId,
+            ["albumId"] = albumId
+        };
+        if (artistId is int id && id > 0)
+        {
+            body["artistId"] = id;
+        }
+
+        return body;
+    }
+
+    private static RequestRecord? FindRecord(RequestsStore store, Guid userId, int albumId)
+        => store.ListByUser(userId).FirstOrDefault(r => r.LidarrAlbumId == albumId);
+
+    // Moves the album's schedule on right away, so a ready album is searched now rather than
+    // at the next sweep. Best-effort: any failure leaves it to the sweep.
+    private async Task SearchNowIfReadyAsync(RequestsStore store, int albumId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var upstream = await Upstream.SendAsync(
+                HttpMethod.Get,
+                "album",
+                "?albumIds=" + albumId.ToString(CultureInfo.InvariantCulture),
+                body: null,
+                HttpCompletionOption.ResponseContentRead,
+                cancellationToken).ConfigureAwait(false);
+            if (!upstream.IsSuccessStatusCode)
+            {
+                return;
+            }
+
+            var bytes = await upstream.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(bytes);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() == 0)
+            {
+                return;
+            }
+
+            await Scheduler.AdvanceStoredAsync(
+                store,
+                albumId,
+                doc.RootElement[0],
+                DateTimeOffset.UtcNow,
+                maySearch: true,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or JsonException
+            || (ex is TaskCanceledException && !cancellationToken.IsCancellationRequested))
+        {
+            _logger.LogWarning(ex, "Immediate search for album {AlbumId} failed; the request sync will retry", albumId);
+        }
+    }
+
     // Best-effort: flip the album to monitored. An unmonitored album won't be picked up
     // by AlbumSearch, so this is required before re-running the search on a re-request.
     private async Task EnsureAlbumMonitoredAsync(int albumId, CancellationToken cancellationToken)
@@ -1222,7 +1578,7 @@ public class LidarrController : ControllerBase
             var content = new ByteArrayContent(Encoding.UTF8.GetBytes(body.ToJsonString()));
             content.Headers.ContentType = new MediaTypeHeaderValue(MediaTypeNames.Application.Json);
 
-            using var resp = await _client.SendAsync(
+            using var resp = await Upstream.SendAsync(
                 HttpMethod.Put,
                 "album/monitor",
                 queryString: null,
@@ -1252,97 +1608,6 @@ public class LidarrController : ControllerBase
         }
     }
 
-    // Best-effort: flip the artist to monitored via Lidarr's bulk editor. Required when
-    // re-running AlbumSearch on an album whose artist had been unmonitored — Lidarr skips
-    // unmonitored artists entirely. Lidarr has no /artist/monitor convenience endpoint;
-    // /artist/editor with artistIds+monitored is the bulk-edit equivalent.
-    private async Task EnsureArtistMonitoredAsync(int artistId, CancellationToken cancellationToken)
-    {
-        try
-        {
-            var body = new JsonObject
-            {
-                ["artistIds"] = new JsonArray(artistId),
-                ["monitored"] = true
-            };
-            var content = new ByteArrayContent(Encoding.UTF8.GetBytes(body.ToJsonString()));
-            content.Headers.ContentType = new MediaTypeHeaderValue(MediaTypeNames.Application.Json);
-
-            using var resp = await _client.SendAsync(
-                HttpMethod.Put,
-                "artist/editor",
-                queryString: null,
-                content,
-                HttpCompletionOption.ResponseContentRead,
-                cancellationToken).ConfigureAwait(false);
-
-            if (!resp.IsSuccessStatusCode)
-            {
-                _logger.LogWarning(
-                    "Lidarr monitor=true for artist {ArtistId} returned {Status}",
-                    artistId,
-                    (int)resp.StatusCode);
-            }
-        }
-        catch (HttpRequestException ex)
-        {
-            _logger.LogWarning(ex, "Failed to re-monitor artist {ArtistId}", artistId);
-        }
-        catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (TaskCanceledException ex)
-        {
-            _logger.LogWarning(ex, "Monitor request for artist {ArtistId} timed out", artistId);
-        }
-    }
-
-    // Best-effort: queue an AlbumSearch on Lidarr's command queue. Failures don't bubble
-    // up — the album add already succeeded and the row is inserted; if the search command
-    // can't be queued the user can retry from Lidarr's UI.
-    private async Task TriggerAlbumSearchAsync(int albumId, CancellationToken cancellationToken)
-    {
-        try
-        {
-            var body = new JsonObject
-            {
-                ["name"] = "AlbumSearch",
-                ["albumIds"] = new JsonArray(albumId)
-            };
-            var content = new ByteArrayContent(Encoding.UTF8.GetBytes(body.ToJsonString()));
-            content.Headers.ContentType = new MediaTypeHeaderValue(MediaTypeNames.Application.Json);
-
-            using var resp = await _client.SendAsync(
-                HttpMethod.Post,
-                "command",
-                queryString: null,
-                content,
-                HttpCompletionOption.ResponseContentRead,
-                cancellationToken).ConfigureAwait(false);
-
-            if (!resp.IsSuccessStatusCode)
-            {
-                _logger.LogWarning(
-                    "Lidarr AlbumSearch command for album {AlbumId} returned {Status}",
-                    albumId,
-                    (int)resp.StatusCode);
-            }
-        }
-        catch (HttpRequestException ex)
-        {
-            _logger.LogWarning(ex, "Failed to queue AlbumSearch for album {AlbumId}", albumId);
-        }
-        catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (TaskCanceledException ex)
-        {
-            _logger.LogWarning(ex, "AlbumSearch command for album {AlbumId} timed out", albumId);
-        }
-    }
-
     private async Task<string?> ResolveCoverUrlAsync(string lookupPath, string mbid, string preferredCoverType, CancellationToken cancellationToken)
     {
         var cacheKey = $"norisync:lidarr:cover:{lookupPath}:{mbid}:{preferredCoverType}";
@@ -1351,7 +1616,7 @@ public class LidarrController : ControllerBase
             return cached;
         }
 
-        using var upstream = await _client.SendAsync(
+        using var upstream = await Upstream.SendAsync(
             HttpMethod.Get,
             $"{lookupPath}/lookup",
             $"?term=lidarr:{Uri.EscapeDataString(mbid)}",
@@ -1428,7 +1693,7 @@ public class LidarrController : ControllerBase
 
     private async Task<int?> ResolveFirstIdAsync(string upstreamPath, string queryKey, string mbid, CancellationToken cancellationToken)
     {
-        using var upstream = await _client.SendAsync(
+        using var upstream = await Upstream.SendAsync(
             HttpMethod.Get,
             upstreamPath,
             $"?{queryKey}={Uri.EscapeDataString(mbid)}",
@@ -1466,7 +1731,7 @@ public class LidarrController : ControllerBase
     {
         var tracks = new JsonArray();
 
-        using var upstream = await _client.SendAsync(
+        using var upstream = await Upstream.SendAsync(
             HttpMethod.Get,
             "track",
             $"?albumId={albumId}",
@@ -1583,17 +1848,20 @@ public class LidarrController : ControllerBase
     {
         var title = ReadString(t, "title");
         long? duration = ReadLong(t, "length");
+        string? recordingMbid = null;
 
         // Track-level title/length aren't always populated; fall back to the linked recording.
-        if ((title == null || duration == null) && t.TryGetProperty("recording", out var rec))
+        if (t.TryGetProperty("recording", out var rec) && rec.ValueKind == JsonValueKind.Object)
         {
             title ??= ReadString(rec, "title");
             duration ??= ReadLong(rec, "length");
+            recordingMbid = ReadString(rec, "id");
         }
 
         return new JsonObject
         {
             ["title"] = title,
+            ["recordingMbid"] = recordingMbid,
             ["trackNumber"] = ReadInt(t, "position") ?? ReadInt(t, "number"),
             ["discNumber"] = discNumber,
             ["duration"] = duration,
@@ -1606,6 +1874,7 @@ public class LidarrController : ControllerBase
         return new JsonObject
         {
             ["title"] = ReadString(t, "title"),
+            ["recordingMbid"] = ReadString(t, "foreignRecordingId"),
             ["trackNumber"] = ReadInt(t, "absoluteTrackNumber") ?? ReadInt(t, "trackNumber"),
             ["discNumber"] = ReadInt(t, "mediumNumber") ?? fallbackDiscNumber,
             ["duration"] = ReadLong(t, "duration"),
@@ -1617,7 +1886,7 @@ public class LidarrController : ControllerBase
     {
         var albums = new JsonArray();
 
-        using var upstream = await _client.SendAsync(
+        using var upstream = await Upstream.SendAsync(
             HttpMethod.Get,
             "album",
             $"?artistId={artistId}&includeAllArtistAlbums=true",
@@ -1781,26 +2050,43 @@ public class LidarrController : ControllerBase
             ? l
             : null;
 
+    // Routes acting on a request already made talk to the backend that holds it: switching the
+    // album backend leaves earlier requests where they went.
+    private void UseBackendOfCallersRequest(string mbid)
+    {
+        if (GetJellyfinUser() is { } user)
+        {
+            UseBackendHolding(user.Id, mbid);
+        }
+    }
+
+    private ObjectResult InteractiveSearchUnsupported()
+        => StatusCode(StatusCodes.Status501NotImplemented, new
+        {
+            Error = BackendName + " doesn't list releases to pick from. Its own search runs instead.",
+            Code = "interactive_search_unsupported"
+        });
+
+    private void UseBackendHolding(Guid userId, string? mbid, int? albumId = null)
+    {
+        foreach (var backend in _backends.All)
+        {
+            var rows = backend.Store?.ListByUser(userId);
+            if (rows != null && rows.Any(r => (mbid != null && string.Equals(r.AlbumMbid, mbid, StringComparison.OrdinalIgnoreCase))
+                || (albumId != null && r.LidarrAlbumId == albumId)))
+            {
+                _backend = backend;
+                return;
+            }
+        }
+    }
+
     private ObjectResult ServiceUnavailable(string message)
         => StatusCode(StatusCodes.Status503ServiceUnavailable, new { Error = message });
 
-    private static bool IsAdministrator(User user)
-        => user.Permissions
-            .FirstOrDefault(p => p.Kind == PermissionKind.IsAdministrator)?.Value ?? false;
+    private static bool IsAdministrator(User user) => RequestCallers.IsAdministrator(user);
 
-    private User? GetJellyfinUser()
-    {
-        var claim = User.FindFirstValue("Jellyfin-UserId")
-            ?? User.FindFirstValue(ClaimTypes.NameIdentifier);
-
-        if (Guid.TryParse(claim, out var userId))
-        {
-            var userManager = HttpContext.RequestServices.GetRequiredService<IUserManager>();
-            return userManager.GetUserById(userId);
-        }
-
-        return null;
-    }
+    private User? GetJellyfinUser() => RequestCallers.Resolve(this);
 
     /// <summary>
     /// Wraps the upstream cover stream so disposing the response stream also disposes the

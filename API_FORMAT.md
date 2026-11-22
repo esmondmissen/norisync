@@ -204,9 +204,10 @@ Response: `PlaylistChangesResponse` (see §4.5a).
 
 ### 3.4 `GET /api/norisync/waveform/changes`
 
-Paged waveform feed. Each row carries the local waveform analysis blob for one
-track. Clients sync this feed separately from the main library so the per-track
-binary payloads stay off the album/track changes endpoint.
+Paged waveform feed. Each row carries the local waveform analysis blob and the
+48-byte beat mix descriptor (§4.11) for one track. Clients sync this feed
+separately from the main library so the per-track binary payloads stay off the
+album/track changes endpoint.
 
 Query parameters:
 
@@ -217,8 +218,15 @@ Query parameters:
 | `startIndex` | int | `0` | Zero-based offset. |
 | `limit` | int | `100` | Max 500. |
 | `libraryIds` | Guid (repeatable) | — | **Required.** Restrict results to tracks reachable through these libraries. Repeat the parameter for multiple ids. |
+| `omitUnchangedWaveforms` | bool | `false` | With `since`: a row whose waveform hasn't changed since `since` comes with `Waveform` `null` and `WaveformUnchanged` `true` (the client holds it from an earlier page). Off by default, for clients that read a `null` waveform as "none". |
 
 Response: `WaveformChangesResponse` (see §4.8).
+
+A row's `ProcessedAt` moves only when something in it changed: its waveform or
+its version, its descriptor or the descriptor's wire version, or the libraries
+it's served under. Re-analysing a track to the same bytes (a new analyser
+revision, a touched file) leaves it off the feed. A track is re-analysed when
+an analyser version, its file's modified time or its file's size changed.
 
 ### 3.5 `GET /api/norisync/waveform/status`
 
@@ -256,14 +264,20 @@ Feed timestamps are strictly increasing, so a page's `LatestTimestamp` /
 ### 3.7 `GET /api/norisync/info`
 
 JSON-only, **anonymous**. Returns `{ "Id": Guid, "Name": string, "Version": string,
-"LidarrConfigured": bool, "AudioMuseInstalled": bool, "AudioMuseEnabled": bool,
+"LidarrConfigured": bool, "AlbumRequestsBackend": "Lidarr" | "SoulSync" | null,
+"TrackRequestsConfigured": bool, "AudioMuseInstalled": bool, "AudioMuseEnabled": bool,
 "AudioMuseVersion": string | null, "Features": string[] }`. Used for server discovery and
 version negotiation. `Features` names the optional APIs this build offers, so a client checks
 for one instead of comparing build numbers: `"playback"` (§3.20).
 Older builds send no `Features`; read its absence as none.
-`LidarrConfigured` is `true` when Lidarr's URL and API key are both set on the server
-*and*, when `LidarrRequireAdmin` is enabled, the calling user is a Jellyfin
-administrator. Anonymous callers always see `false` in the admin-gated case.
+`LidarrConfigured` is `true` when **album requests** are available on either backend (named
+for Lidarr, the first): Lidarr's URL and key are set, or SoulSync's are with its
+Lidarr-compatible API on (`SoulSyncAlbumsEnabled`) — *and*, when `LidarrRequireAdmin` is
+enabled, the calling user is a Jellyfin administrator. Anonymous callers always see `false`
+in the admin-gated case. `AlbumRequestsBackend` names the backend new album requests go to
+(§3.16), `null` whenever `LidarrConfigured` is false; older builds send none (read it as
+`"Lidarr"`). `TrackRequestsConfigured` is `true` when **song requests** (§3.21) are
+available: SoulSync's URL and key are set, under the same admin gate.
 `AudioMuseInstalled` is `true` when the third-party AudioMuse AI plugin
 (matched by manifest GUID `e3831be1-c025-4ebc-bc79-121ad0dfc4e1`) is present on the server;
 `AudioMuseEnabled` additionally requires it to be enabled and supported, and
@@ -352,7 +366,7 @@ end-of-file detection and gapless playback instead of approximating the playable
 `RunTimeTicks` (a metadata-rounded duration that over-reports the real sample count). The server
 combines `ffprobe` with container-specific header parsing: the exact bits come from the
 `iTunSMPB` tag (MP4/AAC/ALAC), the Xing/LAME header (MP3), or the stream's own sample count
-(lossless). MessagePack (`AudioInfoDto`, §4.11) or JSON.
+(lossless). MessagePack (`AudioInfoDto`, §4.12) or JSON.
 
 Caller must be able to see the item (standard Jellyfin visibility). Results are cached
 server-side and invalidated by the source file's mtime. Status codes:
@@ -372,7 +386,30 @@ hard EOF boundary.
 ### 3.16 Lidarr proxy `/api/norisync/lidarr/*`
 
 JSON-only. Proxies a curated subset of [Lidarr's v1 API](https://lidarr.audio/docs/api/);
-the Lidarr API key is held server-side and never exposed to clients. Most routes return
+the Lidarr API key is held server-side and never exposed to clients.
+
+**Two album backends.** The same routes run against Lidarr or against SoulSync's
+Lidarr-compatible API (`{SoulSyncBaseUrl}/lidarr/api/v1`, off in SoulSync by default; the
+plugin uses it only once the config page's check found it, `SoulSyncAlbumsEnabled`). A new
+album request goes to the only backend set up, or to `AlbumRequestBackend` (admin's choice,
+default `Lidarr`) when both are. Routes acting on a request already made (`/search`,
+`/releases`, `/releases/grab`, `DELETE /requests/…`) use the backend holding the caller's
+request, so switching leaves earlier requests where they went. Album ids are the backend's own,
+so each backend has its own store (`requests.db`, `soulsync-requests.db`) and every
+`RequestRecord` names its `Backend`. On SoulSync:
+
+- an `AlbumSearch` puts the album's tracks on SoulSync's wishlist, which retries them itself:
+  the schedule searches at once (SoulSync reads the tracklist from MusicBrainz when it
+  searches, so there are no releases to wait for), reads "N tracks queued" as `Grabbed`
+  (N > 0) and then searches no more;
+- the root folder and profiles are SoulSync's own (the first of each), no setup asked;
+- `/albums/{mbid}/releases` and `/releases/grab` answer **`501`**
+  `{ Error, Code: "interactive_search_unsupported" }` (SoulSync has no release list);
+- `/albums/{mbid}/tracks` always comes from MusicBrainz (SoulSync's `track?albumId=` is
+  empty);
+- its queue is always empty, so `Status` comes from SoulSync's download tasks for the album's
+  tracks (matched by album and artist name): `Downloading` with the mean progress of those
+  downloading, `Importing` while one is post-processed, else `Pending`. Most routes return
 pass-through Lidarr JSON. Auth requires a valid Jellyfin token on every route. Per-route
 gating: **any auth** = any authenticated Jellyfin user; **request-gated** = admin when
 `LidarrRequireAdmin` is `true`, otherwise any auth; **admin** = always admin-only.
@@ -381,15 +418,18 @@ gating: **any auth** = any authenticated Jellyfin user; **request-gated** = admi
 |--------|-------|-------------|------|
 | GET | `/search?term=...` | Combined artist/album search. | any auth |
 | GET | `/artists/{mbid}/albums` | Normalized discography for an artist. Falls back to MusicBrainz when the artist is not in Lidarr (cached 24h). Response: `{ "source": "library" \| "discovery", "albums": [...] }`. 404 only when the artist is unknown to MusicBrainz. | any auth |
-| GET | `/albums/{mbid}/tracks` | Normalized tracklist for an album. Falls back to MusicBrainz metadata when the album is not yet in Lidarr — clients can preview tracks before requesting. Response: `{ "source": "library" \| "discovery", "tracks": [...] }`. 404 only when the release-group is unknown to MusicBrainz. | any auth |
+| GET | `/artists/{mbid}/monitoring` | Whether Lidarr follows the artist: `{ "InLidarr": bool, "Monitored": bool, "MonitorNewItems": "all" \| "none" \| "new" \| null }`. `400` unless `mbid` is a GUID. | any auth |
+| PUT | `/artists/{mbid}/monitoring` | Changes it. Body `{ "Monitored": bool?, "MonitorNewItems": "all" \| "none" \| "new"? }`; a field left out stays as it is. Goes through Lidarr's `PUT artist/editor`, which never touches the artist's albums' own monitored flags (unmonitoring stops RSS for them; it doesn't unmonitor them). `Monitored: true` for an artist **not in Lidarr** adds it with the configured root folder and profiles, following only future releases (`addOptions.monitor: "future"`, `MonitorNewItems` default `"new"`, no search) — every album already out stays unmonitored, except ones MusicBrainz has no release date for. Returns the state afterwards. | request-gated |
+| GET | `/albums/{mbid}/tracks` | Normalized tracklist for an album. Falls back to MusicBrainz metadata when the album is not yet in Lidarr — clients can preview tracks before requesting. Response: `{ "source": "library" \| "discovery", "tracks": [...] }`. Each track carries its `recordingMbid` (Lidarr's `foreignRecordingId`, or MusicBrainz's recording), which a song request (§3.21) takes. Answers from MusicBrainz alone when only song requests are set up. 404 only when the release-group is unknown to MusicBrainz. | any auth |
 | GET | `/covers/artist/{mbid}` | Streams the artist's poster image. Resolved via Lidarr lookup, cached for 60 min. | any auth |
 | GET | `/covers/release-group/{rgid}` | Streams the album cover. Same resolution path as the artist cover. | any auth |
-| POST | `/albums/{mbid}/request` | Adds the album to Lidarr using configured defaults (root folder, quality profile, metadata profile), monitors **both the album and its artist** (Lidarr skips unmonitored artists during search, and an already-imported artist ignores the artist payload on POST `/album`), inserts a tracking row, and explicitly queues a fresh `AlbumSearch` command. If Lidarr reports the album has already been imported, the endpoint runs the same monitor + upsert + search recovery path. The response is the same `RequestRecord` shape (200) in either case (same shape as a row in `GET /requests` — see below). | request-gated |
-| GET | `/albums/{mbid}/releases` | Interactive (manual) search — returns Lidarr's raw release candidates for the album (`GET /release?albumId=`). Requires the album to already exist in Lidarr; otherwise `409` with `{ Error, Code: "album_not_in_lidarr" }`. Pass-through Lidarr JSON (see below). | request-gated |
-| POST | `/albums/{mbid}/releases/grab` | Grabs one candidate and sends it to the download client (`POST /release`). Body `{ "guid": <string>, "indexerId": <int> }`, copied from a candidate. Flips the album + artist to monitored, upserts a tracking row, and returns the `RequestRecord` (200). `409` if the album isn't in Lidarr. | request-gated |
-| GET | `/requests` | Caller's tracked requests. Admins can pass `?all=true` to see every user, or `?userId=<guid>` to filter to one. Response is an array of `RequestRecord` (see below). | any auth |
+| POST | `/albums/{mbid}/request` | Adds the album to Lidarr using configured defaults (root folder, quality profile, metadata profile), monitored, inserts a tracking row and starts its **search schedule** (see below) — it does not search itself. A **new** artist is created monitored with only this album monitored (`addOptions.albumsToMonitor`, `monitorNewItems: "none"`); an **existing** artist keeps its own monitoring. If Lidarr reports the album has already been added, the endpoint monitors it, upserts the row and restarts the schedule (searching at once if its releases are loaded). The response is the same `RequestRecord` shape (200) in either case (same shape as a row in `GET /requests` — see below). | request-gated |
+| POST | `/albums/{mbid}/search` | "Search Again": restarts the album's search schedule (a fresh 14-day window) and searches at once if Lidarr has its releases. Tracks the album for the caller if they had no row. Returns the caller's `RequestRecord`. `409` (`album_not_in_lidarr`) if the album isn't in Lidarr. | request-gated |
+| GET | `/albums/{mbid}/releases` | Interactive (manual) search — Lidarr's release candidates for the album (`GET /release?albumId=`), queried live from every indexer (up to 3 min), in Lidarr's ranking, as `ReleaseCandidate`s (see below). Requires the album to already exist in Lidarr; otherwise `409` with `{ Error, Code: "album_not_in_lidarr" }`. | request-gated |
+| POST | `/albums/{mbid}/releases/grab` | Grabs one candidate and sends it to the download client (`POST /release`, naming the album and artist so a result Lidarr couldn't match by title can still be taken). Body `{ "guid": <string>, "indexerId": <int> }`, copied from a candidate. Monitors the album (the artist keeps its own setting), upserts a tracking row, holds the search schedule for 6 h, and returns the `RequestRecord` (200). `409` if the album isn't in Lidarr; `410` with `Code: "release_expired"` once Lidarr has dropped the search's results (kept 30 min) — search again. | request-gated |
+| GET | `/requests` | Caller's tracked requests, both backends'. Admins can pass `?all=true` to see every user, or `?userId=<guid>` to filter to one. Response is an array of `RequestRecord` (see below). | any auth |
 | GET | `/queue` | Lidarr download queue. Non-admins get the queue filtered to records whose `albumId` matches one of their tracked requests; admins see Lidarr's response unchanged. | any auth |
-| DELETE | `/requests/{lidarrAlbumId}` | Unmonitors the album in Lidarr (best effort) and removes the tracking row(s). Non-admins can only cancel their own rows. Returns `204`. | owner or admin |
+| DELETE | `/requests/{lidarrAlbumId}?backend=Lidarr\|SoulSync` | Unmonitors the album on its backend (best effort) and removes the tracking row(s). `backend` is the record's `Backend`; without it (older apps) the store holding that id for the caller is used, the active backend's first. Non-admins can only cancel their own rows. Returns `204`. | owner or admin |
 | GET | `/rootfolders` | Lidarr `GET /rootfolder`. Used by the plugin config UI. | **admin** |
 | GET | `/qualityprofiles` | Lidarr `GET /qualityprofile`. | **admin** |
 | GET | `/metadataprofiles` | Lidarr `GET /metadataprofile`. | **admin** |
@@ -426,6 +466,7 @@ singles / compilations / live, etc.
   "tracks": [
     {
       "title": "<string>",
+      "recordingMbid": "<recording-mbid>" | null,
       "trackNumber": <int> | null,
       "discNumber": <int> | null,
       "duration": <int milliseconds> | null,
@@ -443,6 +484,7 @@ imported (`discovery` — `hasFile` is always `false`).
 
 ```json
 {
+  "Backend": "Lidarr" | "SoulSync",
   "JellyfinUserId": "<guid>",
   "LidarrAlbumId": <int>,
   "AlbumMbid": "<release-group-mbid>",
@@ -452,13 +494,22 @@ imported (`discovery` — `hasFile` is always `false`).
   "Status": "Pending" | "Downloading" | "Importing" | "Failed" | "Stalled",
   "StatusUpdatedAt": "<iso8601>",
   "DownloadProgress": <0..1> | null,
-  "LastError": "<string>" | null
+  "LastError": "<string>" | null,
+  "SearchState": "AwaitingMetadata" | "Searching" | "NothingFound" | "Grabbed" | null,
+  "SearchAttempts": <int> | null,
+  "LastSearchedAt": "<iso8601>" | null,
+  "NextSearchAt": "<iso8601>" | null,
+  "LastSearchMessage": "<string>" | null
 }
 ```
 
+The `Search*` fields are the album's search schedule (shared by every user who requested
+it); null before the first sweep reaches it. They sit beside `Status`, never as new `Status`
+values: clients decode `Status` strictly.
+
 Status meanings:
 
-- `Pending` — submitted to Lidarr, no download in flight yet (searching indexers, waiting for cron, etc.).
+- `Pending` — submitted to Lidarr, no download in flight yet. `SearchState` says why.
 - `Downloading` — release grabbed, transfer in progress. `DownloadProgress` is populated.
 - `Importing` — download finished, Lidarr is moving files into the library.
 - `Failed` — Lidarr or the download client gave up. Will not retry without user action.
@@ -467,6 +518,26 @@ Status meanings:
 Rows are removed automatically when the album finishes importing into Lidarr (the
 scheduled task **NoriSync: Sync Lidarr Request Status** runs every minute) — Lidarr is
 the source of truth from import onward. There is no `Imported` status on the wire.
+
+**Search schedule.** The plugin searches requested albums itself rather than relying on
+Lidarr's `searchForNewAlbum`, which never runs for a newly created artist. A search sent
+before Lidarr has loaded the album's releases (an artist refresh that runs after the add,
+one album at a time) rejects every sized result ("Album duration is 0") yet completes
+"successfully", and Lidarr never searches a miss again — RSS only sees new uploads, and only
+for monitored artists. So every minute, for each tracked album neither in Lidarr's queue
+nor fully imported, the **Sync Lidarr Request Status** task:
+
+- `AwaitingMetadata` — waits until a release has a duration (or 1 h has passed, so an
+  album without durations is still searched);
+- `Searching` — has queued `AlbumSearch` and reads the command back
+  (`"Album search completed. N reports downloaded."`; a failed or purged command counts as
+  nothing found);
+- `NothingFound` / `Grabbed` — schedules the next search 15 min, 1 h, 6 h, then every 24 h
+  after the last, until 14 days after the request (or the last "Search Again");
+  `NextSearchAt` is null once the window has passed. A download in progress stops it.
+
+At most 5 searches go out per sweep, so a backlog doesn't hit every indexer at once.
+`AlbumSearch` ignores monitoring, so an album whose artist is unmonitored is still searched.
 
 **Interactive search & grab (`/albums/{mbid}/releases` + `/releases/grab`).**
 
@@ -478,13 +549,23 @@ album id), so the typical flow is: `POST /albums/{mbid}/request` (or otherwise a
 the chosen candidate's `guid` + `indexerId`. Both endpoints return `409` with
 `{ Error, Code: "album_not_in_lidarr" }` when the album isn't in Lidarr yet.
 
-`GET /albums/{mbid}/releases` is a pass-through of Lidarr's
-[`GET /release`](https://lidarr.audio/docs/api/) candidate array — each entry carries `guid`,
-`indexerId`, `indexer`, `title`, `quality`, `size`, `seeders` / `leechers`, `protocol`
-(`"torrent"` / `"usenet"`), `age*`, `downloadUrl`, and `rejected` + `rejections[]` (Lidarr's
-reasons a candidate would be skipped by the active profile). The client copies `guid` +
-`indexerId` from the chosen entry into the grab body. A successful grab monitors the album +
-artist and upserts a `RequestRecord` (status `Pending`), so the download then flows through
+`GET /albums/{mbid}/releases` returns an array of:
+
+```json
+{
+  "Guid": "<string>", "IndexerId": <int>, "Indexer": "<string>" | null,
+  "Title": "<string>", "Size": <bytes> | null, "Quality": "FLAC" | null,
+  "Protocol": "torrent" | "usenet" | null, "Seeders": <int> | null, "Leechers": <int> | null,
+  "AgeHours": <number> | null, "ReleaseGroup": "<string>" | null,
+  "Approved": bool, "TemporarilyRejected": bool, "Rejected": bool, "Rejections": ["<reason>", ...]
+}
+```
+
+Lidarr's `downloadUrl`, `magnetUrl`, `infoUrl` and `commentUrl` are never passed on: indexers
+put their API key in them. `Rejections` are Lidarr's reasons it would skip a candidate on its
+own; a rejected candidate can still be grabbed. The client copies `Guid` + `IndexerId` from
+the chosen entry into the grab body. A successful grab monitors the album
+and upserts a `RequestRecord` (status `Pending`), so the download then flows through
 `GET /requests` and `GET /queue` exactly like an auto-request; the **Sync Lidarr Request
 Status** task advances the status from there.
 
@@ -903,6 +984,77 @@ client reads `devices` when its socket (re)connects, for what it missed.
 
 ---
 
+### 3.21 Song requests `/api/norisync/requests/tracks`
+
+JSON-only. One MusicBrainz **recording** put on SoulSync's wishlist, so a user can ask for a
+single song rather than a whole album. SoulSync's URL and **admin** key (`sk_…`; a read key can
+only GET) are server-side. Gating as §3.16: **request-gated** = admin when
+`LidarrRequireAdmin` is `true` (the one switch for every request).
+
+| Method | Route | Description | Gate |
+|--------|-------|-------------|------|
+| GET | `` | Caller's song requests, newest first; admins `?all=true` or `?userId=<guid>`. Array of `TrackRequestRecord`. | any auth |
+| POST | `/{recordingMbid}` | Requests it. Body (optional fields, from the MusicBrainz result the app shows): `{ "Title", "Artist", "Album", "ReleaseGroupMbid", "AlbumType", "DurationMs" }`; a missing title or artist is read from MusicBrainz. `200` with the caller's `TrackRequestRecord`; `400` unless the id is a MusicBrainz id; `404` when MusicBrainz has no such recording; **`422`** `{ Error, Code: "refused" }` when SoulSync refused it (the profile's request limit, a permission, a blocklist) — `Error` is for the user; **`409`** `{ Error, Code: "not_added" }` when SoulSync wrote nothing (it already has the song, or a manual library match); `503` not configured / unreachable; `504` timed out. | request-gated |
+| POST | `/{recordingMbid}/retry` | Asks again with what was stored (after `Failed`). Same answers. `404` if there's no request for it. | request-gated |
+| DELETE | `/{recordingMbid}` | Cancels the caller's request (an admin's cancels everyone's). The song leaves SoulSync's wishlist once nobody wants it (best effort). `204`; `404` if the caller has none. | owner or admin |
+
+`POST /api/norisync/soulsync/probe` (**admin**) tries an unsaved URL and key for the config
+page: body `{ "BaseUrl", "ApiKey" }`, always `200` with `{ "Status", "Message", "Profiles",
+"AlbumsAvailable", "AlbumsMessage" }`. `Status` is `Connected`, `InvalidUrl`,
+`MissingApiKey`, `Unreachable`, `TimedOut` (10 s), `Unauthorized`, `ReadOnlyKey` (the key
+can't list profiles: `INSUFFICIENT_SCOPE`), `NotSoulSync` or `UnexpectedResponse`.
+`AlbumsAvailable` says whether the Lidarr-compatible API answered.
+
+**`TrackRequestRecord` shape:**
+
+```json
+{
+  "JellyfinUserId": "<guid>",
+  "RecordingMbid": "<recording-mbid>",
+  "SoulSyncTrackId": "<string>",
+  "Title": "<string>",
+  "ArtistName": "<string>",
+  "AlbumTitle": "<string>" | null,
+  "ReleaseGroupMbid": "<release-group-mbid>" | null,
+  "SubmittedAt": "<iso8601>",
+  "Status": "Queued" | "Searching" | "Downloading" | "Importing" | "Failed",
+  "StatusUpdatedAt": "<iso8601>",
+  "DownloadProgress": <0..1> | null,
+  "LastError": "<string>" | null,
+  "RetryCount": <int> | null,
+  "LastAttemptAt": "<iso8601>" | null
+}
+```
+
+A request is removed once the song is in the Jellyfin library, so there is no "available"
+state; clients decode `Status` leniently (unknown → `Queued`).
+
+**How it is sent.** `POST /api/v1/wishlist` with `track_data` `{ id: <recording>, name,
+artists: [{ name }], album: { name, album_type, images: [] }, duration_ms, source:
+"musicbrainz", provider: "musicbrainz" }` and `source_type: "nori"`, then `POST
+wishlist/process` (a `409` there means a run is already going). `source`/`provider` make
+SoulSync read the id as a MusicBrainz recording; without them it is taken for a Spotify id.
+The album has no `id`: a MusicBrainz album id there is a *release*, and with none SoulSync keys
+the row by the recording. SoulSync may store the row under another key (a merged catalogue
+identity); the key it answers with (`data.track.track_id`) is kept. The wishlist is what tags,
+files and imports the download, asks Jellyfin to scan, and retries a miss (every 30 min by
+default). **Not** `POST /api/v1/request`: it only transfers a file (never imported), keeps its
+records in memory for an hour, and its tasks don't appear in `/downloads`. Wishlist rows are
+per SoulSync profile: `SoulSyncProfileId` (`X-Profile-Id`, default 1) on every call, and that
+profile's own request limit and permissions apply. Users asking for one song share its row:
+status is per recording, and the wishlist row is removed only with the last request.
+
+**Status sync** (the request sync task, every minute; one `GET wishlist` walk and one `GET
+downloads` per sweep): in the Jellyfin library (an Audio item whose `MusicBrainzRecording`
+provider id is the recording, or one added since the request with the same title and artist,
+letters and digits compared) → removed; else SoulSync's download task for it (tasks carry no
+wishlist id: matched by title and artist) → `downloading` = `Downloading` with its progress,
+`post_processing`/`completed` = `Importing`, `failed`/`not_found` = `Failed` with its error,
+anything else `Searching`; else on the wishlist → `Queued`, with its `failure_reason` as
+`LastError` once tried; else off the wishlist (SoulSync drops the row when the file is
+published, before Jellyfin scans it) → `Importing` for an hour, then `Failed`. A wishlist that
+can't be read changes nothing.
+
 ## 4. MessagePack DTO definitions
 
 Tables below list each field with its `[Key(N)]` index.
@@ -1031,6 +1183,12 @@ this DTO**. The per-track waveform is served separately from
 | 2 | long | `SourceMtime` | Source file mtime, ticks. |
 | 3 | byte[]? | `Waveform` | Packed low-res waveform. See §4.10. `null` when analysis failed for the track. |
 | 4 | string? | `WaveformVersion` | Analyzer version (e.g. `"waveform-v5.7"`). Bumped on any format or algorithm change; clients should re-fetch when it differs from their cached copy. |
+| 5 | byte[]? | `MixProfile` | 48-byte beat mix descriptor. See §4.11. `null` when the track is too short (< 8 s) or silent for one, or the row hasn't been analysed since the descriptor was added. |
+| 6 | string? | `MixProfileVersion` | Descriptor version, `"mixprofile-v1"`. Set whenever the track was analysed, even when `MixProfile` is `null`. Treat any other value as no descriptor. |
+| 7 | bool | `WaveformUnchanged` | `true` only for a client that sent `omitUnchangedWaveforms` (§3.4): `Waveform` was left out because the client already holds it — keep the stored one. |
+
+Keys 5–7 are additive: a client that predates them ignores them, and a row
+from a server that predates them reads them as `null` / `false`.
 
 ### 4.10 `Waveform` binary layout
 
@@ -1099,7 +1257,120 @@ for i in 0 ..< (bytes.count - 4) / 4:
     b4       = (word >>  6) & 0xF
 ```
 
-### 4.11 `AudioInfoDto`
+### 4.11 `MixProfile` binary layout (`mixprofile-v1`)
+
+A fixed 48-byte, **little-endian** beat descriptor per track, for beat-synced
+crossfades. It is computed from the same decode as the waveform (ffmpeg, mono
+44.1 kHz), so it shares the waveform's timeline: every time is a `u32` in
+**0.1 ms units (100 µs) from the first decoded sample** of the original file.
+For a Jellyfin original streamed as the `Static=true` file that is playback's
+timeline; a transcode's encoder priming can shift it (up to ~50 ms).
+
+It describes two regions, each a steady beat lattice fitted by least squares to
+the tracked beats in it:
+
+- **HEAD** — the first 60 s, `[0, min(60 s, duration)]`.
+- **TAIL** — the last 90 s, `[max(0, duration − 90 s), duration]`. On a track
+  under 150 s the regions overlap; under 60 s they are the same span.
+
+```
+offset  size  field
+0       1     'M' (0x4D)
+1       1     'P' (0x50)
+2       1     format = 0x01
+3       1     flags: bit0 HEAD valid, bit1 TAIL valid,
+                     bit2 HEAD downbeat confident, bit3 TAIL downbeat confident,
+                     bits 4–7 zero
+4       20    HEAD region block
+24      20    TAIL region block
+44      4     u32 outroRecedesAt (0.1 ms); 0xFFFFFFFF = none
+```
+
+Region block (20 bytes):
+
+| Offset | Type | Field | Meaning |
+|--------|------|-------|---------|
+| +0 | u32 | `periodMicros` | Beat period in **µs**, folded into 80–160 BPM (375 000–750 000). |
+| +4 | u32 | `referenceBeat` | A lattice beat near the middle of the region's supported beats (0.1 ms). Beat *k* of the lattice is `referenceBeat + k · period`. |
+| +8 | u32 | `firstBeat` | First confident beat of the region (0.1 ms), on the lattice. |
+| +12 | u32 | `lastBeat` | Last confident beat of the region (0.1 ms), on the lattice. |
+| +16 | u8 | `confidence` | 0–255: how well the lattice holds (below). |
+| +17 | u8 | `downbeatOffset` | Bar phase, 0–3: beats `referenceBeat + (downbeatOffset + 4m) · period` start bars. 255 = unknown. |
+| +18 | u8 | `downbeatConfidence` | 0–255. |
+| +19 | u8 | reserved | 0. |
+
+**An invalid region is 20 zero bytes with its valid flag clear.** The blob is
+`null` only for a track under 8 s or silent (below −80 dBFS); an audible track
+with no clear beat still gets a blob, flags `0x00`, so it isn't re-analysed
+every run.
+
+**Field semantics.**
+
+- **Lattice.** `firstBeat ≤ referenceBeat ≤ lastBeat`, and both ends are lattice
+  beats: `(firstBeat − referenceBeat) / period` is an integer to within the
+  0.1 ms rounding. Extrapolate beyond `[firstBeat, lastBeat]` only with care —
+  the region's music may not have a beat there (a beatless intro or outro).
+- **Tempo folding.** The tracker's tempo is folded into 80–160 BPM. A track
+  tracked at 60 BPM reports 120 (every other lattice beat falls between the
+  kicks); one tracked at 180 reports 90 (every other kick, the parity with more
+  low-band weight).
+- **Supported beat.** A tracked beat that is a real onset (its broadband or
+  40–150 Hz level over the 93 ms after it is ≥ 0.65 dB above the 93 ms before)
+  and lies within **±15 ms** of the lattice. `firstBeat` / `lastBeat` are the
+  first / last supported lattice beats that start / end a run of at least 3
+  supported beats in 4, so a stray onset in an intro doesn't count.
+- **`confidence`** = (supported tracked beats ÷ all tracked beats inside
+  `[firstBeat − ½·period, lastBeat + ½·period]`) × min(1, supported ÷ 16), × 255.
+  A region is valid only with ≥ 8 supported beats and confidence ≥ 0.25 (64).
+  A drifting tempo (live playing) reads low; a programmed beat reads near 255.
+- **Downbeat** (best effort). Low-band (≈40–150 Hz) energy at each of the 4 beat
+  positions, normalised within every whole bar between `firstBeat` and
+  `lastBeat`, then averaged. `downbeatOffset` is the strongest position;
+  `downbeatConfidence` is `(best − runner-up) / best` × 255 (an even
+  four-on-the-floor reads ~0). Unknown (255, confidence 0) with fewer than 4
+  whole bars or no contrast at all. The flag bit is set at confidence ≥ 0.2
+  (51) — **use the offset only when the flag is set.**
+- **`outroRecedesAt`** (track-wide; computed for the tail). The time after which
+  the 1.5 s-smoothed 40–150 Hz RMS stays below **0.5 ×** its 75th percentile over
+  the whole track, all the way to the end — sharpened to the end of the last
+  ~46 ms block above that line. `0xFFFFFFFF` when the track has no low end, or
+  the line is crossed within the last second (it ends at full energy). It may
+  lie before the tail region on a long outro.
+
+Clients **must** reject any blob that isn't exactly 48 bytes starting
+`4D 50 01`, and should treat a `MixProfileVersion` other than
+`"mixprofile-v1"` as no descriptor.
+
+**Decoding example (pseudocode):**
+
+```
+assert(len(b) == 48 and b[0..3] == [0x4D, 0x50, 0x01])
+u32(o) = b[o] | b[o+1] << 8 | b[o+2] << 16 | b[o+3] << 24
+region(o, valid, downbeatFlag):
+    if not valid: return none
+    period = u32(o) / 1e6                       // seconds
+    ref    = u32(o + 4) / 1e4                   // seconds
+    first  = u32(o + 8) / 1e4
+    last   = u32(o + 12) / 1e4
+    conf   = b[o + 16] / 255
+    bar    = b[o + 17] if downbeatFlag and b[o + 17] <= 3 else unknown
+head  = region(4,  b[3] & 1, b[3] & 4)
+tail  = region(24, b[3] & 2, b[3] & 8)
+outro = none if u32(44) == 0xFFFFFFFF else u32(44) / 1e4
+beat_time(region, k) = region.ref + k * region.period
+```
+
+**Golden blob** (fixed field values, pinned by `MixProfileAnalyzerTests.GoldenBlob_ForFixedFields`):
+head 483 871 µs (124 BPM), reference 30.1234 s, first 0.6073 s, last 59.6395 s (±61 beats),
+confidence 242, downbeat 3 (confidence 180, confident); tail 468 750 µs
+(128 BPM), reference 205.3125 s, first 150.0 s (−118 beats), last 239.0625 s (+72), confidence 200,
+downbeat unknown; outro recedes at 240.1 s.
+
+```
+4D500107 1F620700B2980400B9170000AB190900F203B400 0E27070005541F0060E31600617A2400C8FF0000 E8A22400
+```
+
+### 4.12 `AudioInfoDto`
 
 Returned by `GET /api/norisync/audio/{id}/info` (§3.15). All sample counts are per channel.
 
@@ -1142,3 +1413,13 @@ left `null`. Only a file that even a full decode can't read falls back to
   exact in-place downsample, no re-analysis) and resurface on the waveform feed
   with a bumped `ProcessedAt`, so clients pick them up on the next sync without
   waiting for the nightly analysis task.
+- **Mix descriptor (`mixprofile-v1`).** `WaveformChangeDto` gained `MixProfile`
+  (Key 5) and `MixProfileVersion` (Key 6), additively (§4.9). A track is
+  up to date only when both its `WaveformVersion` and `MixProfileVersion` match
+  the server's, so the first analysis run after upgrading re-decodes every
+  track once (about one waveform pass) and each row resurfaces on the waveform
+  feed with a bumped `ProcessedAt` — clients get the descriptor through their
+  existing cursor. A change to the descriptor's layout or to what a field means
+  bumps the version string (and, for the layout, the format byte at offset 2);
+  clients treat an unknown version as no descriptor, never a guess. The
+  per-beat grid of earlier builds is gone and is not coming back on this feed.

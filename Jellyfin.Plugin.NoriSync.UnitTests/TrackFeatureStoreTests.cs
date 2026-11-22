@@ -121,7 +121,7 @@ public sealed class TrackFeatureStoreTests : IDisposable
             waveformVersion: "waveform-v5.6");
         _store.Upsert(feature, Array.Empty<Guid>());
 
-        Assert.False(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", feature.SourceMtime));
+        Assert.False(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, feature.SourceMtime, -1));
     }
 
     [Fact]
@@ -130,12 +130,259 @@ public sealed class TrackFeatureStoreTests : IDisposable
         var feature = MakeFeature(
             waveform: new byte[] { 1 },
             waveformVersion: "waveform-v5.6",
-            sourceMtime: 100);
+            sourceMtime: 100,
+            mixProfileVersion: MixProfileAnalyzer.Version);
         _store.Upsert(feature, Array.Empty<Guid>());
 
-        Assert.True(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", 100));
-        Assert.False(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.5", 100));
-        Assert.False(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", 101));
+        Assert.True(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, -1));
+        Assert.False(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.5", MixProfileAnalyzer.Version, 100, -1));
+        Assert.False(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 101, -1));
+    }
+
+    [Fact]
+    public void HasFreshWaveform_RequiresTheCurrentMixProfileVersion()
+    {
+        // A row analysed before the descriptor existed (or by an older descriptor) is stale,
+        // so the next run re-decodes it once — however fresh its waveform.
+        var none = MakeFeature(waveform: new byte[] { 1 }, waveformVersion: "waveform-v5.6", sourceMtime: 100);
+        var older = MakeFeature(waveform: new byte[] { 1 }, waveformVersion: "waveform-v5.6", sourceMtime: 100, mixProfile: new byte[48], mixProfileVersion: "mixprofile-v0");
+        var current = MakeFeature(waveform: new byte[] { 1 }, waveformVersion: "waveform-v5.6", sourceMtime: 100, mixProfile: new byte[48], mixProfileVersion: MixProfileAnalyzer.Version);
+        foreach (var feature in new[] { none, older, current })
+        {
+            _store.Upsert(feature, Array.Empty<Guid>());
+        }
+
+        Assert.False(_store.HasFreshWaveform(none.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, -1));
+        Assert.False(_store.HasFreshWaveform(older.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, -1));
+        Assert.True(_store.HasFreshWaveform(current.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, -1));
+        Assert.False(_store.HasFreshWaveform(current.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 101, -1));
+    }
+
+    [Fact]
+    public void HasFreshWaveform_ANullDescriptorAtTheCurrentVersionIsFresh()
+    {
+        // A track too short or silent for a descriptor is analysed once, not every night.
+        var feature = MakeFeature(waveform: new byte[] { 1 }, waveformVersion: "waveform-v5.6", sourceMtime: 100, mixProfileVersion: MixProfileAnalyzer.Version);
+        _store.Upsert(feature, Array.Empty<Guid>());
+
+        Assert.True(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, -1));
+    }
+
+    [Fact]
+    public void Upsert_MixProfile_RoundtripsViaGetAndTheFeed()
+    {
+        var libraryId = Guid.NewGuid();
+        var descriptor = Enumerable.Range(0, 48).Select(i => (byte)i).ToArray();
+        var feature = MakeFeature(waveform: new byte[] { 5 }, waveformVersion: "waveform-v5.6", mixProfile: descriptor, mixProfileVersion: MixProfileAnalyzer.Version);
+        _store.Upsert(feature, new[] { libraryId });
+
+        var loaded = _store.Get(feature.ItemId)!;
+        Assert.Equal(descriptor, loaded.MixProfile);
+        Assert.Equal(MixProfileAnalyzer.Version, loaded.MixProfileVersion);
+
+        var row = Assert.Single(_store.GetProcessedSince(DateTimeOffset.MinValue, until: null, new[] { libraryId }, limit: 100, offset: 0));
+        Assert.Equal(descriptor, row.MixProfile);
+        Assert.Equal(MixProfileAnalyzer.Version, row.MixProfileVersion);
+    }
+
+    [Fact]
+    public void Upsert_ADescriptorOntoAnExistingRow_ResurfacesItAfterAnIssuedCursor()
+    {
+        // A client that synced the waveform before the descriptor existed holds a cursor past
+        // the row; writing the descriptor must move the row past that cursor again.
+        var libraryId = Guid.NewGuid();
+        var feature = MakeFeature(waveform: new byte[] { 5 }, waveformVersion: "waveform-v5.6");
+        _store.Upsert(feature, new[] { libraryId });
+        var cursor = SyncClock.IssueCursor();
+        Assert.Empty(_store.GetProcessedSince(cursor, until: null, new[] { libraryId }, limit: 100, offset: 0));
+
+        feature.MixProfile = new byte[48];
+        feature.MixProfileVersion = MixProfileAnalyzer.Version;
+        _store.Upsert(feature, new[] { libraryId });
+
+        var row = Assert.Single(_store.GetProcessedSince(cursor, until: null, new[] { libraryId }, limit: 100, offset: 0));
+        Assert.Equal(new byte[48], row.MixProfile);
+        Assert.True(row.ProcessedAt > cursor);
+    }
+
+    [Fact]
+    public void HasFreshWaveform_AFileReplacedWithItsModifiedDateKeptIsStale()
+    {
+        var feature = MakeFeature(waveform: new byte[] { 1 }, waveformVersion: "waveform-v5.6", sourceMtime: 100, mixProfileVersion: MixProfileAnalyzer.Version);
+        feature.SourceSize = 5_000;
+        _store.Upsert(feature, Array.Empty<Guid>());
+
+        Assert.True(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, 5_000));
+        Assert.False(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, 5_001));
+        Assert.True(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, -1), "an unreadable size isn't compared");
+    }
+
+    [Fact]
+    public void HasFreshWaveform_ARowWithNoSizeTakesTheFilesWithoutAReDecode()
+    {
+        // Rows from before sizes were stored: fresh on the mtime alone once, and from then on
+        // the size is checked too.
+        var feature = MakeFeature(waveform: new byte[] { 1 }, waveformVersion: "waveform-v5.6", sourceMtime: 100, mixProfileVersion: MixProfileAnalyzer.Version);
+        _store.Upsert(feature, Array.Empty<Guid>());
+        Assert.Null(_store.Get(feature.ItemId)!.SourceSize);
+
+        Assert.True(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, 7_000));
+        Assert.Equal(7_000, _store.Get(feature.ItemId)!.SourceSize);
+        Assert.False(_store.HasFreshWaveform(feature.ItemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, 7_001));
+    }
+
+    [Fact]
+    public void Upsert_AReAnalysisThatChangesNothingKeepsTheRowOffTheFeed()
+    {
+        // An analyser revision re-decodes every track; a row it leaves as it was must not be
+        // re-sent to every device.
+        var libraryId = Guid.NewGuid();
+        var feature = MakeFeature(waveform: new byte[] { 5, 6 }, waveformVersion: "waveform-v5.6", sourceMtime: 100,
+                                  mixProfile: new byte[48], mixProfileVersion: MixProfileAnalyzer.Version + "/2");
+        _store.Upsert(feature, new[] { libraryId });
+        var first = _store.Get(feature.ItemId)!;
+        var cursor = SyncClock.IssueCursor();
+
+        var again = Copy(feature);
+        again.MixProfileVersion = MixProfileAnalyzer.Version + "/3";   // same wire version
+        again.SourceMtime = 200;                                        // touched, same audio
+        _store.Upsert(again, new[] { libraryId });
+
+        Assert.Empty(_store.GetProcessedSince(cursor, until: null, new[] { libraryId }, limit: 100, offset: 0));
+        var stored = _store.Get(feature.ItemId)!;
+        Assert.Equal(first.ProcessedAt, stored.ProcessedAt);
+        Assert.Equal(first.WaveformChangedAt, stored.WaveformChangedAt);
+        Assert.Equal(MixProfileAnalyzer.Version + "/3", stored.MixProfileVersion);
+        Assert.Equal(200, stored.SourceMtime);
+    }
+
+    [Fact]
+    public void Upsert_ANewDescriptorResendsTheRowButNotItsWaveform()
+    {
+        var libraryId = Guid.NewGuid();
+        var feature = MakeFeature(waveform: new byte[] { 5, 6 }, waveformVersion: "waveform-v5.6", mixProfile: new byte[48], mixProfileVersion: MixProfileAnalyzer.Version);
+        _store.Upsert(feature, new[] { libraryId });
+        var cursor = SyncClock.IssueCursor();
+
+        var again = Copy(feature);
+        again.MixProfile = Enumerable.Repeat((byte)1, 48).ToArray();
+        _store.Upsert(again, new[] { libraryId });
+
+        var row = Assert.Single(_store.GetProcessedSince(cursor, until: null, new[] { libraryId }, limit: 100, offset: 0));
+        Assert.True(row.ProcessedAt > cursor);
+        Assert.True(row.WaveformChangedAt <= cursor, "the client already holds this waveform");
+    }
+
+    [Theory]
+    [InlineData("waveform")]
+    [InlineData("version")]
+    [InlineData("library")]
+    public void Upsert_AChangedWaveformOrLibraryMovesTheWaveformsStamp(string change)
+    {
+        // A client of a library the track just joined never received its waveform.
+        var libraryId = Guid.NewGuid();
+        var feature = MakeFeature(waveform: new byte[] { 5, 6 }, waveformVersion: "waveform-v5.6", mixProfileVersion: MixProfileAnalyzer.Version);
+        _store.Upsert(feature, new[] { libraryId });
+        var cursor = SyncClock.IssueCursor();
+
+        var again = Copy(feature);
+        var libraries = new[] { libraryId };
+        switch (change)
+        {
+            case "waveform": again.Waveform = new byte[] { 5, 7 }; break;
+            case "version": again.WaveformVersion = "waveform-v5.7"; break;
+            default: libraries = new[] { libraryId, Guid.NewGuid() }; break;
+        }
+
+        _store.Upsert(again, libraries);
+
+        var row = Assert.Single(_store.GetProcessedSince(cursor, until: null, new[] { libraryId }, limit: 100, offset: 0));
+        Assert.True(row.ProcessedAt > cursor);
+        Assert.True(row.WaveformChangedAt > cursor);
+    }
+
+    [Fact]
+    public void Open_ARowFromBeforeTheWaveformStampReadsItsLastStamp()
+    {
+        var feature = MakeFeature(waveform: new byte[] { 5 }, waveformVersion: "waveform-v5.6");
+        _store.Upsert(feature, Array.Empty<Guid>());
+        using (var connection = new SqliteConnection($"Data Source={Path.Combine(_tempDir, "features.db")}"))
+        {
+            connection.Open();
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "UPDATE TrackFeatures SET WaveformChangedAt = NULL";
+            cmd.ExecuteNonQuery();
+        }
+
+        var stored = _store.Get(feature.ItemId)!;
+        Assert.Equal(stored.ProcessedAt, stored.WaveformChangedAt);
+    }
+
+    [Fact]
+    public void Open_OnPreMixProfileSchema_AddsTheColumns_AndTheRowReadsStale()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "norisync-mixmigrate-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var dbPath = Path.Combine(dir, "features.db");
+        var itemId = Guid.Parse("22222222-2222-2222-2222-222222222222");
+
+        try
+        {
+            using (var seed = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                seed.Open();
+                using var cmd = seed.CreateCommand();
+                cmd.CommandText = @"
+                    CREATE TABLE TrackFeatures (
+                        ItemId TEXT PRIMARY KEY,
+                        Waveform BLOB,
+                        WaveformVersion TEXT,
+                        SourceMtime INTEGER NOT NULL,
+                        ProcessedAt INTEGER NOT NULL
+                    );
+                    INSERT INTO TrackFeatures (ItemId, Waveform, WaveformVersion, SourceMtime, ProcessedAt)
+                    VALUES ('22222222-2222-2222-2222-222222222222', x'4C540600', 'waveform-v5.6', 100, 0);";
+                cmd.ExecuteNonQuery();
+            }
+
+            // Twice: the second open finds the columns already there.
+            for (var open = 0; open < 2; open++)
+            {
+                using var store = new TrackFeatureStore(dir, NullLogger.Instance);
+                var row = store.Get(itemId)!;
+                Assert.Equal(new byte[] { 0x4C, 0x54, 0x06, 0x00 }, row.Waveform);
+                Assert.Null(row.MixProfile);
+                Assert.Null(row.MixProfileVersion);
+                Assert.False(store.HasFreshWaveform(itemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, -1));
+            }
+
+            using (var store = new TrackFeatureStore(dir, NullLogger.Instance))
+            {
+                store.Upsert(
+                    new TrackFeature
+                    {
+                        ItemId = itemId,
+                        Waveform = new byte[] { 0x4C, 0x54, 0x06, 0x00 },
+                        WaveformVersion = "waveform-v5.6",
+                        MixProfile = new byte[48],
+                        MixProfileVersion = MixProfileAnalyzer.Version,
+                        SourceMtime = 100
+                    },
+                    Array.Empty<Guid>());
+                Assert.True(store.HasFreshWaveform(itemId, "waveform-v5.6", MixProfileAnalyzer.Version, 100, -1));
+            }
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+            catch (IOException)
+            {
+                // Best-effort cleanup.
+            }
+        }
     }
 
     [Fact]
@@ -342,16 +589,31 @@ public sealed class TrackFeatureStoreTests : IDisposable
         }
     }
 
+    private static TrackFeature Copy(TrackFeature f) => new()
+    {
+        ItemId = f.ItemId,
+        Waveform = f.Waveform,
+        WaveformVersion = f.WaveformVersion,
+        MixProfile = f.MixProfile,
+        MixProfileVersion = f.MixProfileVersion,
+        SourceMtime = f.SourceMtime,
+        SourceSize = f.SourceSize
+    };
+
     private static TrackFeature MakeFeature(
         byte[]? waveform = null,
         string? waveformVersion = null,
-        long sourceMtime = 0)
+        long sourceMtime = 0,
+        byte[]? mixProfile = null,
+        string? mixProfileVersion = null)
     {
         return new TrackFeature
         {
             ItemId = Guid.NewGuid(),
             Waveform = waveform,
             WaveformVersion = waveformVersion,
+            MixProfile = mixProfile,
+            MixProfileVersion = mixProfileVersion,
             SourceMtime = sourceMtime == 0 ? DateTimeOffset.UtcNow.UtcTicks : sourceMtime,
             ProcessedAt = DateTimeOffset.UtcNow
         };

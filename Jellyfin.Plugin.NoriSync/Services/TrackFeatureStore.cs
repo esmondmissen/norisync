@@ -8,13 +8,18 @@ using Microsoft.Extensions.Logging;
 namespace Jellyfin.Plugin.NoriSync.Services;
 
 /// <summary>
-/// Persists per-track waveform analysis blobs to a SQLite database. Older databases may carry
+/// Persists per-track waveform analysis blobs and beat mix descriptors to a SQLite database.
+/// Older databases may carry
 /// orphaned columns from previous schemas (Scores, Bpm, KeyRoot, KeyMode, Lufs, BeatGrid,
 /// BeatGridVersion); the embedding columns (ModelVersion, Embedding, EmbeddingDim) are dropped
 /// on upgrade — see <see cref="InitializeDatabase"/>.
 /// </summary>
 public class TrackFeatureStore : IDisposable
 {
+    /// <summary>What <see cref="ReadRecord"/> reads, in its order.</summary>
+    private const string RecordColumns =
+        "ItemId, SourceMtime, ProcessedAt, Waveform, WaveformVersion, MixProfile, MixProfileVersion, SourceSize, WaveformChangedAt";
+
     private readonly SqliteConnection _connection;
     private readonly ILogger _logger;
     private readonly object _connectionLock = new();
@@ -49,7 +54,11 @@ public class TrackFeatureStore : IDisposable
     /// <remarks>
     /// <see cref="TrackFeature.ProcessedAt"/> is stamped here, by <see cref="SyncClock"/>, as the
     /// row commits — it is what the waveform feed is paged by, and a stamp taken earlier could
-    /// land behind a cursor a client was handed before the row was saved.
+    /// land behind a cursor a client was handed before the row was saved. It moves only when
+    /// something a client reads changed (the waveform, the descriptor, its wire version, the
+    /// libraries): an analyser revision re-decodes every track, and a stamp on each re-sent the
+    /// whole library to every device. <see cref="TrackFeature.WaveformChangedAt"/> moves only
+    /// with the waveform or the libraries (a client of a newly joined library never had it).
     /// </remarks>
     public void Upsert(TrackFeature feature, IReadOnlyCollection<Guid> libraryIds)
     {
@@ -57,36 +66,108 @@ public class TrackFeatureStore : IDisposable
         {
             SyncClock.Stamp(stamp =>
             {
-                feature.ProcessedAt = stamp;
                 using var tx = _connection.BeginTransaction();
+
+                var stored = ReadStoredForUpsert(feature.ItemId, tx);
+                var librariesChanged = stored == null || !stored.Libraries.SetEquals(LibraryKeys(libraryIds));
+                var waveformChanged = stored == null || librariesChanged
+                    || !BytesEqual(stored.Feature.Waveform, feature.Waveform)
+                    || stored.Feature.WaveformVersion != feature.WaveformVersion;
+                var changed = waveformChanged
+                    || !BytesEqual(stored!.Feature.MixProfile, feature.MixProfile)
+                    || MixProfileAnalyzer.WireVersion(stored.Feature.MixProfileVersion) != MixProfileAnalyzer.WireVersion(feature.MixProfileVersion);
+                feature.ProcessedAt = changed ? stamp : stored!.Feature.ProcessedAt;
+                feature.WaveformChangedAt = waveformChanged ? stamp : stored!.Feature.WaveformChangedAt;
 
                 using (var cmd = _connection.CreateCommand())
                 {
                     cmd.Transaction = tx;
                     cmd.CommandText = @"
-                        INSERT INTO TrackFeatures (ItemId, Waveform, WaveformVersion, SourceMtime, ProcessedAt)
-                        VALUES ($itemId, $waveform, $waveformVersion, $sourceMtime, $processedAt)
+                        INSERT INTO TrackFeatures (ItemId, Waveform, WaveformVersion, MixProfile, MixProfileVersion, SourceMtime, SourceSize, ProcessedAt, WaveformChangedAt)
+                        VALUES ($itemId, $waveform, $waveformVersion, $mixProfile, $mixProfileVersion, $sourceMtime, $sourceSize, $processedAt, $waveformChangedAt)
                         ON CONFLICT(ItemId) DO UPDATE SET
                             Waveform = excluded.Waveform,
                             WaveformVersion = excluded.WaveformVersion,
+                            MixProfile = excluded.MixProfile,
+                            MixProfileVersion = excluded.MixProfileVersion,
                             SourceMtime = excluded.SourceMtime,
-                            ProcessedAt = excluded.ProcessedAt";
+                            SourceSize = excluded.SourceSize,
+                            ProcessedAt = excluded.ProcessedAt,
+                            WaveformChangedAt = excluded.WaveformChangedAt";
 
                     cmd.Parameters.AddWithValue("$itemId", feature.ItemId.ToString());
                     cmd.Parameters.AddWithValue("$waveform", (object?)feature.Waveform ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("$waveformVersion", (object?)feature.WaveformVersion ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$mixProfile", (object?)feature.MixProfile ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$mixProfileVersion", (object?)feature.MixProfileVersion ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("$sourceMtime", feature.SourceMtime);
-                    cmd.Parameters.AddWithValue("$processedAt", stamp.ToUnixTimeMilliseconds());
+                    cmd.Parameters.AddWithValue("$sourceSize", (object?)feature.SourceSize ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$processedAt", feature.ProcessedAt.ToUnixTimeMilliseconds());
+                    cmd.Parameters.AddWithValue("$waveformChangedAt", feature.WaveformChangedAt.ToUnixTimeMilliseconds());
 
                     cmd.ExecuteNonQuery();
                 }
 
-                ReplaceLibrariesInTransaction(feature.ItemId, libraryIds, tx);
+                if (librariesChanged)
+                {
+                    ReplaceLibrariesInTransaction(feature.ItemId, libraryIds, tx);
+                }
 
                 tx.Commit();
             });
         }
     }
+
+    private StoredFeature? ReadStoredForUpsert(Guid itemId, SqliteTransaction tx)
+    {
+        TrackFeature? feature;
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "SELECT " + RecordColumns + " FROM TrackFeatures WHERE ItemId = $itemId";
+            cmd.Parameters.AddWithValue("$itemId", itemId.ToString());
+            using var reader = cmd.ExecuteReader();
+            feature = reader.Read() ? ReadRecord(reader) : null;
+        }
+
+        if (feature == null)
+        {
+            return null;
+        }
+
+        var libraries = new HashSet<string>(StringComparer.Ordinal);
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "SELECT LibraryId FROM TrackFeatureLibraries WHERE ItemId = $itemId";
+            cmd.Parameters.AddWithValue("$itemId", itemId.ToString());
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                libraries.Add(reader.GetString(0));
+            }
+        }
+
+        return new StoredFeature(feature, libraries);
+    }
+
+    /// <summary>The library ids as <see cref="ReplaceLibrariesInTransaction"/> stores them.</summary>
+    private static HashSet<string> LibraryKeys(IReadOnlyCollection<Guid> libraryIds)
+    {
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var id in libraryIds)
+        {
+            if (id != Guid.Empty)
+            {
+                keys.Add(id.ToString());
+            }
+        }
+
+        return keys;
+    }
+
+    private static bool BytesEqual(byte[]? a, byte[]? b)
+        => a == null ? b == null : b != null && a.AsSpan().SequenceEqual(b);
 
     /// <summary>
     /// Replaces the library mappings for a track without touching its feature columns. Used by
@@ -198,7 +279,7 @@ public class TrackFeatureStore : IDisposable
         {
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = @"
-                SELECT ItemId, SourceMtime, ProcessedAt, Waveform, WaveformVersion
+                SELECT " + RecordColumns + @"
                 FROM TrackFeatures WHERE ItemId = $itemId";
             cmd.Parameters.AddWithValue("$itemId", itemId.ToString());
 
@@ -208,30 +289,63 @@ public class TrackFeatureStore : IDisposable
     }
 
     /// <summary>
-    /// Checks whether a non-stale waveform blob exists for the given track. The stored
-    /// <c>WaveformVersion</c> and <c>SourceMtime</c> must both match, and the blob itself
-    /// must be non-null (a prior analysis failure may have left the column empty even
-    /// though the version string was written).
+    /// Checks whether the track's analysis is up to date: the stored <c>WaveformVersion</c>,
+    /// <c>MixProfileVersion</c>, <c>SourceMtime</c> and <c>SourceSize</c> must all match, and
+    /// the waveform blob must be non-null (a prior analysis failure may have left the column
+    /// empty even though the version string was written). The mix descriptor itself may be
+    /// null — a track too short or silent for one is analysed once, not every run.
     /// </summary>
+    /// <remarks>
+    /// The size catches a file replaced with its modified date kept (a tagger or copy that
+    /// preserves it), which the mtime alone read as fresh. A row from before sizes were
+    /// stored takes the file's size here, without a re-decode.
+    /// </remarks>
     /// <param name="itemId">The Jellyfin item id.</param>
     /// <param name="waveformVersion">Expected waveform analyzer version.</param>
+    /// <param name="mixProfileVersion">Expected mix descriptor version.</param>
     /// <param name="sourceMtime">Current source file mtime in ticks.</param>
-    /// <returns>True when a matching waveform exists.</returns>
-    public bool HasFreshWaveform(Guid itemId, string waveformVersion, long sourceMtime)
+    /// <param name="sourceSize">Current source file size in bytes; negative when unknown (not compared).</param>
+    /// <returns>True when a matching analysis exists.</returns>
+    public bool HasFreshWaveform(Guid itemId, string waveformVersion, string mixProfileVersion, long sourceMtime, long sourceSize)
     {
         lock (_connectionLock)
         {
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = @"
-                SELECT 1 FROM TrackFeatures
+                SELECT SourceSize FROM TrackFeatures
                 WHERE ItemId = $itemId
                   AND WaveformVersion = $waveformVersion
+                  AND MixProfileVersion = $mixProfileVersion
                   AND SourceMtime = $sourceMtime
                   AND Waveform IS NOT NULL";
             cmd.Parameters.AddWithValue("$itemId", itemId.ToString());
             cmd.Parameters.AddWithValue("$waveformVersion", waveformVersion);
+            cmd.Parameters.AddWithValue("$mixProfileVersion", mixProfileVersion);
             cmd.Parameters.AddWithValue("$sourceMtime", sourceMtime);
-            return cmd.ExecuteScalar() != null;
+            using (var reader = cmd.ExecuteReader())
+            {
+                if (!reader.Read())
+                {
+                    return false;
+                }
+
+                if (sourceSize < 0)
+                {
+                    return true;
+                }
+
+                if (!reader.IsDBNull(0))
+                {
+                    return reader.GetInt64(0) == sourceSize;
+                }
+            }
+
+            using var backfill = _connection.CreateCommand();
+            backfill.CommandText = "UPDATE TrackFeatures SET SourceSize = $size WHERE ItemId = $itemId AND SourceSize IS NULL";
+            backfill.Parameters.AddWithValue("$size", sourceSize);
+            backfill.Parameters.AddWithValue("$itemId", itemId.ToString());
+            backfill.ExecuteNonQuery();
+            return true;
         }
     }
 
@@ -279,7 +393,7 @@ public class TrackFeatureStore : IDisposable
             var (libraryClause, libraryParamNames) = BuildLibraryFilterClause(libraryIds);
 
             var sql = @"
-                SELECT ItemId, SourceMtime, ProcessedAt, Waveform, WaveformVersion
+                SELECT " + RecordColumns + @"
                 FROM TrackFeatures
                 WHERE ProcessedAt > $since
                   AND " + libraryClause;
@@ -527,14 +641,22 @@ public class TrackFeatureStore : IDisposable
     {
         var waveform = reader.IsDBNull(3) ? null : (byte[])reader["Waveform"];
         var waveformVersion = reader.IsDBNull(4) ? null : reader.GetString(4);
+        var mixProfile = reader.IsDBNull(5) ? null : (byte[])reader["MixProfile"];
+        var mixProfileVersion = reader.IsDBNull(6) ? null : reader.GetString(6);
+        var processedAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(2));
 
         return new TrackFeature
         {
             ItemId = Guid.Parse(reader.GetString(0)),
             SourceMtime = reader.GetInt64(1),
-            ProcessedAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(2)),
+            ProcessedAt = processedAt,
             Waveform = waveform,
-            WaveformVersion = waveformVersion
+            WaveformVersion = waveformVersion,
+            MixProfile = mixProfile,
+            MixProfileVersion = mixProfileVersion,
+            SourceSize = reader.IsDBNull(7) ? null : reader.GetInt64(7),
+            // A row from before the column: its waveform went out with its last stamp.
+            WaveformChangedAt = reader.IsDBNull(8) ? processedAt : DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(8))
         };
     }
 
@@ -550,6 +672,8 @@ public class TrackFeatureStore : IDisposable
                     ItemId TEXT PRIMARY KEY,
                     Waveform BLOB,
                     WaveformVersion TEXT,
+                    MixProfile BLOB,
+                    MixProfileVersion TEXT,
                     SourceMtime INTEGER NOT NULL,
                     ProcessedAt INTEGER NOT NULL
                 );
@@ -589,6 +713,13 @@ public class TrackFeatureStore : IDisposable
             alter.CommandText = "ALTER TABLE TrackFeatures ADD COLUMN WaveformVersion TEXT";
             alter.ExecuteNonQuery();
         }
+
+        // Rows from before the mix descriptor read as stale (MixProfileVersion NULL), so the
+        // next analysis run re-decodes each once and the feed re-sends it.
+        AddColumnIfMissing(existing, "MixProfile", "BLOB");
+        AddColumnIfMissing(existing, "MixProfileVersion", "TEXT");
+        AddColumnIfMissing(existing, "SourceSize", "INTEGER");
+        AddColumnIfMissing(existing, "WaveformChangedAt", "INTEGER");
 
         // Drop the embedding columns from databases written before embeddings were removed.
         // These were NOT NULL, so leaving them would break inserts that no longer supply them.
@@ -686,7 +817,7 @@ public class TrackFeatureStore : IDisposable
                 upd.Transaction = tx;
                 upd.CommandText = @"
                     UPDATE TrackFeatures
-                    SET Waveform = $w, WaveformVersion = $ver, ProcessedAt = $now
+                    SET Waveform = $w, WaveformVersion = $ver, ProcessedAt = $now, WaveformChangedAt = $now
                     WHERE ItemId = $id";
                 upd.Parameters.AddWithValue("$w", v6);
                 upd.Parameters.AddWithValue("$ver", WaveformAnalyzer.Version);
@@ -705,6 +836,27 @@ public class TrackFeatureStore : IDisposable
         }
     }
 
+    private void AddColumnIfMissing(HashSet<string> existing, string column, string type)
+    {
+        if (existing.Contains(column))
+        {
+            return;
+        }
+
+        using var alter = _connection.CreateCommand();
+#pragma warning disable CA2100 // Column name and type are hardcoded literals, not user input.
+        alter.CommandText = $"ALTER TABLE TrackFeatures ADD COLUMN {column} {type}";
+#pragma warning restore CA2100
+        try
+        {
+            alter.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column", StringComparison.OrdinalIgnoreCase))
+        {
+            // Another process added it between the PRAGMA read and here.
+        }
+    }
+
     private HashSet<string> GetTrackFeaturesColumns()
     {
         var columns = new HashSet<string>(StringComparer.Ordinal);
@@ -718,4 +870,6 @@ public class TrackFeatureStore : IDisposable
 
         return columns;
     }
+
+    private sealed record StoredFeature(TrackFeature Feature, HashSet<string> Libraries);
 }
